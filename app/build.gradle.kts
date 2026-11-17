@@ -16,8 +16,13 @@ android {
     applicationId = "com.aistudio.siriai.vzkqlm"
     minSdk = 24
     targetSdk = 36
-    versionCode = 2
-    versionName = "1.1"
+    val ciVersionCode = providers.gradleProperty("appVersionCode").orNull?.toIntOrNull()
+    val ciVersionName = providers.gradleProperty("appVersionName").orNull?.takeIf { it.isNotBlank() }
+    versionCode = ciVersionCode ?: 3
+    versionName = ciVersionName ?: "1.2"
+    val githubRepo = providers.gradleProperty("githubUpdateRepo").orNull?.takeIf { it.isNotBlank() }
+        ?: "princepremi7461889152-oss/Siri-ai-apk"
+    buildConfigField("String", "GITHUB_UPDATE_REPO", "\"$githubRepo\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

@@ -117,7 +117,14 @@ class SiriRepository(private val context: Context) {
     private val _customPitchMultiplier = MutableStateFlow(prefs.getFloat("pitch_multiplier", 1.0f))
     val customPitchMultiplier: StateFlow<Float> = _customPitchMultiplier.asStateFlow()
 
-    private val _updateInfo = MutableStateFlow(UpdateInfo())
+    private val _updateInfo = MutableStateFlow(
+        UpdateInfo(
+            latestVersionCode = com.example.BuildConfig.VERSION_CODE,
+            latestVersionName = com.example.BuildConfig.VERSION_NAME,
+            downloadUrl = "https://github.com/${getGithubUpdateRepo()}/releases",
+            releasePageUrl = "https://github.com/${getGithubUpdateRepo()}/releases"
+        )
+    )
     val updateInfo: StateFlow<UpdateInfo> = _updateInfo.asStateFlow()
 
     init {
@@ -298,6 +305,32 @@ class SiriRepository(private val context: Context) {
 
     fun markInitialPermissionSetupDone() {
         prefs.edit().putBoolean("perm_initial_setup_done", true).commit()
+    }
+
+    // --- GitHub Releases Update Configuration & Dismissal State ---
+    fun getGithubUpdateRepo(): String {
+        return prefs.getString("github_update_repo", com.example.BuildConfig.GITHUB_UPDATE_REPO)
+            ?.takeIf { it.isNotBlank() }
+            ?: com.example.BuildConfig.GITHUB_UPDATE_REPO
+    }
+
+    fun setGithubUpdateRepo(repoSlug: String) {
+        val clean = repoSlug.trim().trim('/')
+        if (clean.contains('/')) {
+            prefs.edit().putString("github_update_repo", clean).apply()
+        }
+    }
+
+    fun updateUpdateInfo(info: UpdateInfo) {
+        _updateInfo.value = info
+    }
+
+    fun getDismissedUpdateVersionCode(): Int {
+        return prefs.getInt("dismissed_update_version_code", -1)
+    }
+
+    fun dismissUpdateForVersion(versionCode: Int) {
+        prefs.edit().putInt("dismissed_update_version_code", versionCode).apply()
     }
 
     // --- User Preferences Memory ---

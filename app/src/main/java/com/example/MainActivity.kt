@@ -13,9 +13,15 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.CameraAlt
@@ -23,7 +29,9 @@ import androidx.compose.material.icons.filled.CheckCircleOutline
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
@@ -33,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,8 +56,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.data.AppUpdateManager
 import com.example.device.BootReceiver
 import com.example.device.PermissionManager
+import com.example.model.AppUpdateState
 import com.example.service.SiriVoiceService
 import com.example.ui.screens.AiStudioScreen
 import com.example.ui.screens.PrivacyScreen
@@ -60,6 +71,8 @@ import com.example.ui.theme.SiriCyan
 import com.example.ui.theme.SiriDarkBackground
 import com.example.ui.theme.SiriDarkSurface
 import com.example.ui.theme.SiriDarkSurfaceVariant
+import com.example.ui.theme.SiriGreen
+import com.example.ui.theme.SiriMagenta
 import com.example.ui.theme.SiriTextPrimary
 import com.example.ui.theme.SiriTextSecondary
 import com.example.viewmodel.SiriViewModel
@@ -105,6 +118,9 @@ class MainActivity : ComponentActivity() {
         val shouldResumeService = intent.getBooleanExtra(BootReceiver.EXTRA_RESUME_BACKGROUND_SERVICE, false)
         if (shouldResumeService) {
             viewModel.setBackgroundVoiceServiceEnabled(true)
+        }
+        if (intent.getBooleanExtra(AppUpdateManager.EXTRA_OPEN_UPDATE_DIALOG, false)) {
+            viewModel.openAvailableUpdateDialogIfNeeded()
         }
     }
 }
@@ -157,6 +173,17 @@ fun MainContent(viewModel: SiriViewModel) {
     LaunchedEffect(viewModel) {
         viewModel.runFirstLaunchPermissionCheck()
     }
+
+    val isOnline by viewModel.isOnline.collectAsState()
+    LaunchedEffect(viewModel, isOnline) {
+        if (isOnline) {
+            viewModel.maybeAutoCheckForUpdates()
+        }
+    }
+
+    val showUpdateDialog by viewModel.showUpdateDialog.collectAsState()
+    val appUpdateState by viewModel.appUpdateState.collectAsState()
+    val latestUpdateInfo by viewModel.repository.updateInfo.collectAsState()
 
     // Handle on-demand single-permission requests cleanly
     LaunchedEffect(viewModel) {
@@ -248,6 +275,167 @@ fun MainContent(viewModel: SiriViewModel) {
                     modifier = Modifier.testTag("permission_settings_dismiss_button")
                 ) {
                     Text("Dismiss", color = SiriTextSecondary)
+                }
+            }
+        )
+    }
+
+    if (showUpdateDialog) {
+        val state = appUpdateState
+        val info = when (state) {
+            is AppUpdateState.UpdateAvailable -> state.info
+            is AppUpdateState.Downloading -> state.info
+            is AppUpdateState.Verifying -> state.info
+            is AppUpdateState.ReadyToInstall -> state.info
+            is AppUpdateState.PermissionNeeded -> state.info
+            is AppUpdateState.Error -> state.info ?: latestUpdateInfo
+            else -> latestUpdateInfo
+        }
+        AlertDialog(
+            onDismissRequest = {
+                if (state !is AppUpdateState.Downloading && state !is AppUpdateState.Verifying) {
+                    viewModel.dismissUpdateDialog()
+                }
+            },
+            containerColor = SiriDarkSurfaceVariant,
+            title = {
+                Text(
+                    text = when (state) {
+                        is AppUpdateState.UpdateAvailable -> "Siri AI Update Available"
+                        is AppUpdateState.Downloading -> "Downloading Update..."
+                        is AppUpdateState.Verifying -> "Verifying APK Integrity..."
+                        is AppUpdateState.PermissionNeeded -> "Install Permission Needed"
+                        is AppUpdateState.UpToDate -> "Siri AI Is Up to Date"
+                        is AppUpdateState.Checking -> "Checking for Updates..."
+                        is AppUpdateState.Error -> "Update Check"
+                        else -> "Siri AI Version v${info.latestVersionName}"
+                    },
+                    color = SiriTextPrimary,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    Text(
+                        text = "Current Version: v${BuildConfig.VERSION_NAME} (Build ${BuildConfig.VERSION_CODE})",
+                        color = SiriTextSecondary,
+                        fontSize = 12.sp
+                    )
+                    if (info.isUpdateAvailable || state is AppUpdateState.UpdateAvailable) {
+                        Text(
+                            text = "Latest Version: v${info.latestVersionName} (Build ${info.latestVersionCode})",
+                            color = SiriCyan,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    when (state) {
+                        is AppUpdateState.Checking -> {
+                            CircularProgressIndicator(color = SiriCyan, modifier = Modifier.padding(vertical = 8.dp))
+                            Text("Contacting official GitHub Releases...", color = SiriTextSecondary, fontSize = 13.sp)
+                        }
+                        is AppUpdateState.Downloading -> {
+                            LinearProgressIndicator(
+                                progress = { state.progress },
+                                color = SiriCyan,
+                                trackColor = SiriDarkSurface,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text("Downloaded ${(state.progress * 100).toInt()}%", color = SiriCyan, fontSize = 12.sp)
+                        }
+                        is AppUpdateState.Verifying -> {
+                            LinearProgressIndicator(
+                                color = SiriGreen,
+                                trackColor = SiriDarkSurface,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text("Verifying SHA-256 signature before opening Android Installer...", color = SiriTextSecondary, fontSize = 12.sp)
+                        }
+                        is AppUpdateState.PermissionNeeded -> {
+                            Text(
+                                "Allow 'Install unknown apps' in Android Settings to proceed with installing verified v${state.info.latestVersionName}. Your settings and assistant data will be preserved.",
+                                color = SiriTextSecondary,
+                                fontSize = 13.sp,
+                                lineHeight = 19.sp
+                            )
+                        }
+                        is AppUpdateState.UpToDate -> {
+                            Text(
+                                "You are running the latest official release from GitHub Releases.",
+                                color = SiriGreen,
+                                fontSize = 13.sp
+                            )
+                        }
+                        is AppUpdateState.Error -> {
+                            Text(state.message, color = SiriMagenta, fontSize = 13.sp, lineHeight = 19.sp)
+                        }
+                        else -> {
+                            Text(info.releaseNotes, color = SiriTextSecondary, fontSize = 13.sp, lineHeight = 19.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                when (state) {
+                    is AppUpdateState.UpdateAvailable -> {
+                        TextButton(
+                            onClick = { viewModel.startDownloadAndInstallUpdate() },
+                            modifier = Modifier.testTag("update_now_button")
+                        ) {
+                            Text("Update Now", color = SiriCyan, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    is AppUpdateState.Error -> {
+                        TextButton(
+                            onClick = {
+                                if (state.info?.isUpdateAvailable == true) {
+                                    viewModel.startDownloadAndInstallUpdate()
+                                } else {
+                                    viewModel.checkForUpdates(userInitiated = true)
+                                }
+                            },
+                            modifier = Modifier.testTag("update_retry_button")
+                        ) {
+                            Text(
+                                if (state.info?.isUpdateAvailable == true) "Retry Update" else "Retry",
+                                color = SiriCyan,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    is AppUpdateState.PermissionNeeded -> {
+                        TextButton(
+                            onClick = { viewModel.startDownloadAndInstallUpdate() },
+                            modifier = Modifier.testTag("update_now_button")
+                        ) {
+                            Text("Install Update", color = SiriCyan, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    is AppUpdateState.UpToDate -> {
+                        TextButton(
+                            onClick = { viewModel.dismissUpdateDialog() },
+                            modifier = Modifier.testTag("update_done_button")
+                        ) {
+                            Text("Done", color = SiriCyan, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    else -> Unit
+                }
+            },
+            dismissButton = {
+                if (state !is AppUpdateState.Downloading &&
+                    state !is AppUpdateState.Verifying &&
+                    state !is AppUpdateState.UpToDate
+                ) {
+                    TextButton(
+                        onClick = { viewModel.dismissUpdateLater() },
+                        modifier = Modifier.testTag("update_later_button")
+                    ) {
+                        Text("Later", color = SiriTextSecondary)
+                    }
                 }
             }
         )

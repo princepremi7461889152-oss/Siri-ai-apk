@@ -293,7 +293,25 @@ data class AiConfig(
 data class UpdateInfo(
     val latestVersionCode: Int = 3,
     val latestVersionName: String = "1.2",
-    val releaseNotes: String = "Added Offline Mode, Online Mode, Office & Study Mode, Automatic Mode Detection, Android Keystore encrypted API key storage, and full voice/UI stability fixes.",
-    val downloadUrl: String = "https://github.com/princepremi7461889152-oss/Siri_Ai_Apk/releases",
+    val releaseNotes: String = "Always-on offline wake word standby, background lifecycle fixes, and verified GitHub Release updates.",
+    val downloadUrl: String = "https://github.com/princepremi7461889152-oss/Siri-ai-apk/releases",
+    val releasePageUrl: String = "https://github.com/princepremi7461889152-oss/Siri-ai-apk/releases",
+    val sha256Checksum: String = "",
+    val checksumAssetUrl: String = "",
+    val assetFileName: String = "app-debug.apk",
+    val assetSizeBytes: Long = 0L,
+    val isUpdateAvailable: Boolean = false,
     val isMandatory: Boolean = false
 )
+
+sealed class AppUpdateState {
+    data object Idle : AppUpdateState()
+    data object Checking : AppUpdateState()
+    data class UpToDate(val currentVersionCode: Int, val currentVersionName: String) : AppUpdateState()
+    data class UpdateAvailable(val info: UpdateInfo) : AppUpdateState()
+    data class Downloading(val progress: Float, val info: UpdateInfo) : AppUpdateState()
+    data class Verifying(val info: UpdateInfo) : AppUpdateState()
+    data class ReadyToInstall(val apkPath: String, val info: UpdateInfo) : AppUpdateState()
+    data class PermissionNeeded(val apkPath: String, val info: UpdateInfo) : AppUpdateState()
+    data class Error(val message: String, val info: UpdateInfo? = null) : AppUpdateState()
+}

@@ -71,9 +71,12 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.BuildConfig
+import com.example.model.AppUpdateState
 import com.example.model.AssistantMode
 import com.example.model.LanguageOption
 import com.example.model.VoicePersonality
+import com.example.model.WakeWordOption
 import com.example.service.SiriVoiceService
 import com.example.ui.theme.SiriCyan
 import com.example.ui.theme.SiriDarkBackground
@@ -99,6 +102,8 @@ fun AiStudioScreen(
     val userPrefs by viewModel.repository.userPreferences.collectAsState()
     val continuousListening by viewModel.repository.continuousListening.collectAsState()
     val wakeWordEnabled by viewModel.repository.wakeWordEnabled.collectAsState()
+    val wakeWordOption by viewModel.repository.wakeWordOption.collectAsState()
+    val wakeHardwareStatus by viewModel.wakeHardwareStatus.collectAsState()
     val speedMultiplier by viewModel.repository.customSpeedMultiplier.collectAsState()
     val pitchMultiplier by viewModel.repository.customPitchMultiplier.collectAsState()
 
@@ -891,7 +896,7 @@ fun AiStudioScreen(
                         )
                     }
 
-                    // Wake phrase toggle
+                    // Wake phrase toggle & phrase selector
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -899,13 +904,47 @@ fun AiStudioScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Wake Word Activation", color = SiriTextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
-                            Text("Recognize 'Hey Siri' / 'Siri' / 'Suno Siri' prefix", color = SiriTextSecondary, fontSize = 12.sp)
+                            Text("Always-on offline 'Hey Siri' / 'Siri' detection", color = SiriTextSecondary, fontSize = 12.sp)
                         }
                         Switch(
                             checked = wakeWordEnabled,
                             onCheckedChange = { viewModel.repository.setWakeWordEnabled(it) },
                             colors = SwitchDefaults.colors(checkedThumbColor = SiriCyan, checkedTrackColor = SiriCyan.copy(alpha = 0.3f))
                         )
+                    }
+
+                    if (wakeWordEnabled) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                                for (opt in WakeWordOption.values()) {
+                                    val isSelected = wakeWordOption == opt
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (isSelected) SiriCyan.copy(alpha = 0.25f) else Color(0xFF141E2C),
+                                        border = androidx.compose.foundation.BorderStroke(1.dp, if (isSelected) SiriCyan else Color(0xFF28364D)),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .clickable { viewModel.setWakeWordOption(opt) }
+                                            .testTag("wake_option_${opt.name.lowercase()}")
+                                    ) {
+                                        Text(
+                                            text = if (opt == WakeWordOption.SUNO_SIRI) "Suno Siri" else opt.label,
+                                            color = if (isSelected) SiriCyan else SiriTextSecondary,
+                                            fontSize = 11.sp,
+                                            modifier = Modifier.padding(vertical = 6.dp),
+                                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = wakeHardwareStatus.detailMessage,
+                                color = SiriTextSecondary,
+                                fontSize = 11.sp,
+                                lineHeight = 15.sp
+                            )
+                        }
                     }
 
                     // Reduced Motion Accessibility toggle
@@ -931,7 +970,9 @@ fun AiStudioScreen(
 
             // 5. In-App Update Verification & System Info
             val updateInfo by viewModel.repository.updateInfo.collectAsState()
-            val showUpdateDialog by viewModel.showUpdateDialog.collectAsState()
+            val appUpdateState by viewModel.appUpdateState.collectAsState()
+            var repoInput by remember { mutableStateOf(viewModel.repository.getGithubUpdateRepo()) }
+            var editingRepo by remember { mutableStateOf(false) }
 
             Text(
                 text = "In-App Updates & System Integrity",
@@ -954,61 +995,94 @@ fun AiStudioScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text("Siri AI Assistant", color = SiriTextPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                            Text("Installed Version: v${updateInfo.latestVersionName} (Build ${updateInfo.latestVersionCode})", color = SiriTextSecondary, fontSize = 12.sp)
+                            Text(
+                                "Installed: v${BuildConfig.VERSION_NAME} (Build ${BuildConfig.VERSION_CODE})",
+                                color = SiriTextSecondary,
+                                fontSize = 12.sp
+                            )
+                            Text(
+                                "Source: github.com/${repoInput}",
+                                color = SiriTextSecondary,
+                                fontSize = 11.sp
+                            )
                         }
+                        val hasNewer = updateInfo.isUpdateAvailable
+                        val badgeText = when {
+                            appUpdateState is AppUpdateState.Checking -> "Checking..."
+                            hasNewer -> "v${updateInfo.latestVersionName} Available"
+                            else -> "Up to Date"
+                        }
+                        val badgeColor = if (hasNewer) SiriCyan else SiriGreen
                         Surface(
-                            color = SiriGreen.copy(alpha = 0.2f),
-                            shape = RoundedCornerShape(8.dp)
+                            color = badgeColor.copy(alpha = 0.2f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.clickable {
+                                if (hasNewer) viewModel.openAvailableUpdateDialogIfNeeded()
+                            }
                         ) {
-                            Text("Up to Date", color = SiriGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                            Text(
+                                badgeText,
+                                color = badgeColor,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
                         }
+                    }
+
+                    if (editingRepo) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        OutlinedTextField(
+                            value = repoInput,
+                            onValueChange = { repoInput = it },
+                            label = { Text("GitHub Repository (owner/repo)", color = SiriTextSecondary, fontSize = 11.sp) },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = SiriCyan,
+                                unfocusedBorderColor = Color(0xFF28364D),
+                                focusedTextColor = SiriTextPrimary,
+                                unfocusedTextColor = SiriTextPrimary
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        androidx.compose.material3.TextButton(
+                            onClick = {
+                                viewModel.repository.setGithubUpdateRepo(repoInput)
+                                editingRepo = false
+                            }
+                        ) {
+                            Text("Save Update Source", color = SiriCyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Change GitHub Source",
+                            color = SiriCyan,
+                            fontSize = 11.sp,
+                            modifier = Modifier.clickable { editingRepo = true }
+                        )
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
 
                     Button(
-                        onClick = { viewModel.checkForUpdates() },
+                        onClick = { viewModel.checkForUpdates(userInitiated = true) },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C2738)),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth().testTag("check_updates_button")
                     ) {
                         Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = SiriCyan, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Verify Latest Release & Manifest", color = SiriTextPrimary, fontSize = 13.sp)
+                        Text(
+                            if (updateInfo.isUpdateAvailable) "Review & Install Update v${updateInfo.latestVersionName}" else "Check for GitHub Release Updates",
+                            color = SiriTextPrimary,
+                            fontSize = 13.sp
+                        )
                     }
                 }
-            }
-
-            if (showUpdateDialog) {
-                androidx.compose.material3.AlertDialog(
-                    onDismissRequest = { viewModel.dismissUpdateDialog() },
-                    title = { Text("Siri AI Version ${updateInfo.latestVersionName}", color = SiriTextPrimary, fontWeight = FontWeight.Bold) },
-                    text = {
-                        Column {
-                            Text("Version Code: ${updateInfo.latestVersionCode}", color = SiriCyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(updateInfo.releaseNotes, color = SiriTextSecondary, fontSize = 13.sp, lineHeight = 19.sp)
-                        }
-                    },
-                    containerColor = SiriDarkSurfaceVariant,
-                    confirmButton = {
-                        androidx.compose.material3.TextButton(
-                            onClick = {
-                                viewModel.deviceController.openApp(updateInfo.downloadUrl)
-                                viewModel.dismissUpdateDialog()
-                            }
-                        ) {
-                            Text("Release Page", color = SiriCyan, fontWeight = FontWeight.Bold)
-                        }
-                    },
-                    dismissButton = {
-                        androidx.compose.material3.TextButton(onClick = { viewModel.dismissUpdateDialog() }) {
-                            Text("Done", color = SiriTextSecondary)
-                        }
-                    }
-                )
             }
         }
     }

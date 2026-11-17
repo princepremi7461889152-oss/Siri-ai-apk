@@ -40,8 +40,11 @@ import com.example.model.InformationFreshness
 import com.example.model.IntentExecutionResult
 import com.example.model.ReminderItem
 import com.example.model.WakeWordOption
+import com.example.voice.ActivationSoundPlayer
+import com.example.voice.AlwaysOnWakeWordEngine
 import com.example.voice.SiriSpeechRecognizer
 import com.example.voice.SiriTextToSpeech
+import com.example.voice.SoundTriggerCapabilityProbe
 import com.example.voice.WakeWordDetector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -231,6 +234,7 @@ class SiriVoiceService : Service() {
     private var intentParser: SiriIntentParser? = null
     private var speechRecognizer: SiriSpeechRecognizer? = null
     private var textToSpeech: SiriTextToSpeech? = null
+    private var alwaysOnWakeEngine: AlwaysOnWakeWordEngine? = null
     private val wakeWordDetector = WakeWordDetector()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -420,10 +424,41 @@ class SiriVoiceService : Service() {
             }
         )
 
+        alwaysOnWakeEngine = AlwaysOnWakeWordEngine(
+            context = applicationContext,
+            onWakeDetected = { matchedPhrase, confidence ->
+                mainHandler.post {
+                    onOfflineWakeWordTriggered(matchedPhrase, confidence)
+                }
+            },
+            onHardwareError = { reason ->
+                mainHandler.post {
+                    handleAlwaysOnHardwareError(reason)
+                }
+            }
+        ).apply {
+            wakeWordOption = repo.wakeWordOption.value
+        }
+
+        serviceScope.launch {
+            repo.wakeWordOption.collect { option ->
+                alwaysOnWakeEngine?.wakeWordOption = option
+                if (isServiceRunning && isWakeStandbyActive && !pausedForForegroundUi) {
+                    mainHandler.post {
+                        updateNotification("Always-On ${option.label} • Say \"${option.label}\"")
+                    }
+                }
+            }
+        }
+
+        val hardwareStatus = SoundTriggerCapabilityProbe.probe(applicationContext)
+        Log.d(TAG, "Wake Engine Capability: ${hardwareStatus.detailMessage}")
+
         textToSpeech = SiriTextToSpeech(applicationContext) { speaking ->
             isAssistantSpeaking = speaking
             if (!speaking) {
                 wakeWordDetector.markAssistantFinishedSpeaking()
+                alwaysOnWakeEngine?.markAssistantFinishedSpeaking()
                 if (awaitingWakeFollowUp && isServiceRunning && !pausedForForegroundUi) {
                     awaitingWakeFollowUp = false
                     startBackgroundSpeechCapture()
@@ -476,9 +511,7 @@ class SiriVoiceService : Service() {
             onSilentRestartNeeded = {
                 isOurRecognizerRecording = false
                 if (shouldResumeStandbyNow()) {
-                    consecutiveIdleCycles = (consecutiveIdleCycles + 1).coerceAtMost(20)
-                    val delay = computeStandbyBackoffDelay(isError = consecutiveErrorCount > 0)
-                    scheduleWakeStandbyRestart(delay)
+                    scheduleWakeStandbyRestart(STANDBY_RESTART_DELAY_MS)
                 }
             },
             onNoSpeechDetected = {
@@ -520,55 +553,60 @@ class SiriVoiceService : Service() {
         registerAudioRecordingMonitor()
     }
 
+    private fun handleAlwaysOnHardwareError(reason: String) {
+        isOurRecognizerRecording = false
+        if (!hasRecordAudioPermission()) {
+            isWakeStandbyActive = false
+            pausedDueToScreenLock = false
+            alwaysOnWakeEngine?.stop()
+            updateNotification("Microphone permission required for wake listening")
+            return
+        }
+        if (isVoiceCallOrExternalMicBusy()) {
+            pausedDueToAudioInterruption = true
+            alwaysOnWakeEngine?.stop()
+            updateNotification("Paused during call / external mic use • Will resume")
+            return
+        }
+        if (isDeviceInDoze()) {
+            pausedDueToDeviceIdle = true
+            alwaysOnWakeEngine?.stop()
+            updateNotification("Doze battery saver • Resumes when active")
+            return
+        }
+        if (isScreenOff) {
+            // OEM blocked continuous mic stream after screen lock — pause gracefully until unlock
+            pausedDueToScreenLock = true
+            alwaysOnWakeEngine?.stop()
+            updateNotification("Screen locked ($reason) • Unlock to resume")
+            return
+        }
+        Log.d(TAG, "Always-On wake engine notice: $reason")
+    }
+
     private fun handleSpeechErrorOccurred(err: String) {
         if (!hasRecordAudioPermission()) {
             isWakeStandbyActive = false
             pausedDueToScreenLock = false
+            alwaysOnWakeEngine?.stop()
             updateNotification("Microphone permission required for voice listening")
-            return
-        }
-
-        if ((isScreenOff || isDeviceInDoze()) && isWakeStandbyActive) {
-            // Android / OEM / Doze blocked mic while screen is locked — pause gracefully & recover automatically on unlock
-            pausedDueToScreenLock = isScreenOff
-            pausedDueToDeviceIdle = isDeviceInDoze()
-            cancelWakeStandbyRestart()
-            updateNotification("Screen locked • Mic paused; unlock or tap 'Listen'")
             return
         }
 
         if (isVoiceCallOrExternalMicBusy()) {
             pausedDueToAudioInterruption = true
             cancelWakeStandbyRestart()
+            alwaysOnWakeEngine?.stop()
             updateNotification("Paused during call / external audio • Will resume")
             return
         }
 
-        if (isWakeStandbyActive && isServiceRunning && !isAssistantSpeaking && !pausedForForegroundUi) {
-            if (consecutiveErrorCount >= MAX_CONSECUTIVE_STANDBY_ERRORS) {
-                isWakeStandbyActive = false
-                updateNotification("Standby paused after mic errors • Tap 'Hey Siri' to retry")
-            } else {
-                scheduleWakeStandbyRestart(computeStandbyBackoffDelay(isError = true))
-            }
-        } else if (resumeStandbyAfterCommand) {
+        if (resumeStandbyAfterCommand) {
+            restoreStandbyIfNeeded()
+        } else if (isWakeStandbyActive && isServiceRunning && !pausedForForegroundUi) {
             restoreStandbyIfNeeded()
         } else {
             updateNotification("Background Voice Ready • $err")
-        }
-    }
-
-    private fun computeStandbyBackoffDelay(isError: Boolean): Long {
-        if (isError && consecutiveErrorCount > 0) {
-            val exp = 1L shl (consecutiveErrorCount - 1).coerceAtMost(5)
-            return (500L * exp).coerceAtMost(20_000L)
-        }
-        // Adaptive idle pacing avoids burning battery with tight 280ms polling loops during prolonged silence
-        return when {
-            consecutiveIdleCycles <= 2 -> STANDBY_RESTART_DELAY_MS
-            consecutiveIdleCycles <= 5 -> 900L
-            consecutiveIdleCycles <= 10 -> 1_800L
-            else -> 3_000L
         }
     }
 
@@ -589,19 +627,20 @@ class SiriVoiceService : Service() {
             resumeStandbyAfterCommand = false
             isWakeStandbyActive = true
         }
-        if (isWakeStandbyActive && !pausedForForegroundUi && !pausedDueToAudioInterruption && !pausedDueToScreenLock) {
-            updateNotification("Hey Siri Standby Active • Say \"Hey Siri\"")
-            scheduleWakeStandbyRestart(STANDBY_RESTART_DELAY_MS)
+        if (isWakeStandbyActive && !pausedForForegroundUi && !pausedDueToAudioInterruption && !pausedDueToScreenLock && !pausedDueToDeviceIdle) {
+            startWakeWordStandbyMode()
         } else {
             updateNotification(currentIdleNotificationText())
         }
     }
 
     private fun currentIdleNotificationText(): String {
+        val wakeLabel = repository?.wakeWordOption?.value?.label ?: "Hey Siri"
         return when {
             pausedDueToAudioInterruption -> "Paused during call / external mic use"
             pausedDueToScreenLock -> "Screen locked • Unlock or tap 'Command'"
-            isWakeStandbyActive -> "Hey Siri Standby Active • Say \"Hey Siri\""
+            pausedDueToDeviceIdle -> "Doze battery saver • Resumes when active"
+            isWakeStandbyActive -> "Always-On $wakeLabel • Say \"$wakeLabel\""
             else -> "Background Voice Active • Tap 'Listen' or 'Command'"
         }
     }
@@ -654,6 +693,8 @@ class SiriVoiceService : Service() {
                     pausedDueToScreenLock = false
                     pausedDueToDeviceIdle = false
                     cancelWakeStandbyRestart()
+                    alwaysOnWakeEngine?.stop()
+                    isOurRecognizerRecording = false
                     startBackgroundSpeechCapture()
                 }
                 return START_STICKY
@@ -668,6 +709,8 @@ class SiriVoiceService : Service() {
                     pausedDueToDeviceIdle = false
                     if (pauseInitially) {
                         isWakeStandbyActive = true
+                        alwaysOnWakeEngine?.stop()
+                        isOurRecognizerRecording = false
                         updateNotification("Siri Foreground Active • Mic handed to app")
                     } else {
                         startWakeWordStandbyMode()
@@ -685,6 +728,7 @@ class SiriVoiceService : Service() {
                 resumeStandbyAfterCommand = false
                 pausedDueToScreenLock = false
                 cancelWakeStandbyRestart()
+                alwaysOnWakeEngine?.stop()
                 isOurRecognizerRecording = false
                 speechRecognizer?.cancel()
                 updateNotification("Background Voice Active • Tap 'Listen' or 'Hey Siri'")
@@ -751,6 +795,7 @@ class SiriVoiceService : Service() {
         pausedForForegroundUi = true
         cancelWakeStandbyRestart()
         cancelBackgroundTimeout()
+        alwaysOnWakeEngine?.stop()
         isOurRecognizerRecording = false
         speechRecognizer?.cancel()
         updateNotification("Siri Foreground Active • Mic handed to app")
@@ -770,6 +815,7 @@ class SiriVoiceService : Service() {
         if (wantWake) {
             startWakeWordStandbyMode()
         } else {
+            alwaysOnWakeEngine?.stop()
             updateNotification("Background Voice Active • Tap 'Listen' or 'Command'")
         }
     }
@@ -789,6 +835,7 @@ class SiriVoiceService : Service() {
         cancelBackgroundTimeout()
         cancelWakeStandbyRestart()
         backgroundAiJob?.cancel()
+        alwaysOnWakeEngine?.stop()
         speechRecognizer?.cancel()
         try {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -884,20 +931,25 @@ class SiriVoiceService : Service() {
     private fun startWakeWordStandbyMode() {
         if (!hasRecordAudioPermission()) {
             isWakeStandbyActive = false
-            updateNotification("Microphone permission required for Hey Siri standby")
+            alwaysOnWakeEngine?.stop()
+            isOurRecognizerRecording = false
+            updateNotification("Microphone permission required for wake listening")
             return
         }
         if (isVoiceCallOrExternalMicBusy()) {
             isWakeStandbyActive = true
             pausedDueToAudioInterruption = true
+            alwaysOnWakeEngine?.stop()
+            isOurRecognizerRecording = false
             updateNotification("Paused during call / external mic use")
             return
         }
-        if (isScreenOff || isDeviceInDoze()) {
+        if (isDeviceInDoze()) {
             isWakeStandbyActive = true
-            pausedDueToScreenLock = isScreenOff
-            pausedDueToDeviceIdle = isDeviceInDoze()
-            updateNotification("Screen locked • Standby pauses until unlock")
+            pausedDueToDeviceIdle = true
+            alwaysOnWakeEngine?.stop()
+            isOurRecognizerRecording = false
+            updateNotification("Doze battery saver • Resumes when active")
             return
         }
         consecutiveErrorCount = 0
@@ -906,9 +958,20 @@ class SiriVoiceService : Service() {
         pausedDueToScreenLock = false
         pausedDueToDeviceIdle = false
         pausedDueToAudioInterruption = false
-        updateNotification("Hey Siri Standby Active • Say \"Hey Siri\"")
+        val wakeLabel = repository?.wakeWordOption?.value?.label ?: "Hey Siri"
+        alwaysOnWakeEngine?.wakeWordOption = repository?.wakeWordOption?.value ?: WakeWordOption.HEY_SIRI
+
         if (!pausedForForegroundUi) {
-            scheduleWakeStandbyRestart(120L)
+            // Single continuous offline AudioRecord stream — NEVER restarts mic in a loop
+            val started = alwaysOnWakeEngine?.start() == true
+            isOurRecognizerRecording = started
+            if (started) {
+                updateNotification("Always-On $wakeLabel • Say \"$wakeLabel\"")
+            } else {
+                updateNotification("Background Standby Ready • Tap 'Listen' or 'Command'")
+            }
+        } else {
+            updateNotification("Siri Foreground Active • Mic handed to app")
         }
     }
 
@@ -923,23 +986,16 @@ class SiriVoiceService : Service() {
             }
             if (isVoiceCallOrExternalMicBusy()) {
                 pausedDueToAudioInterruption = true
+                alwaysOnWakeEngine?.stop()
+                isOurRecognizerRecording = false
                 updateNotification("Paused during call / external mic use")
                 return@Runnable
             }
-            try {
-                wakeWordDetector.resetUtteranceMetrics()
-                isOurRecognizerRecording = true
-                speechRecognizer?.startListening(standbyMode = true)
-            } catch (e: Exception) {
-                isOurRecognizerRecording = false
-                Log.w(TAG, "Wake standby start failed", e)
-                consecutiveErrorCount++
-                if (consecutiveErrorCount >= MAX_CONSECUTIVE_STANDBY_ERRORS) {
-                    isWakeStandbyActive = false
-                    updateNotification("Background Voice Ready • Tap 'Listen'")
-                } else {
-                    scheduleWakeStandbyRestart(computeStandbyBackoffDelay(isError = true))
-                }
+            val started = alwaysOnWakeEngine?.start() == true
+            isOurRecognizerRecording = started
+            if (started) {
+                val wakeLabel = repository?.wakeWordOption?.value?.label ?: "Hey Siri"
+                updateNotification("Always-On $wakeLabel • Say \"$wakeLabel\"")
             }
         }
         standbyRestartRunnable = runnable
@@ -949,6 +1005,41 @@ class SiriVoiceService : Service() {
     private fun cancelWakeStandbyRestart() {
         standbyRestartRunnable?.let { mainHandler.removeCallbacks(it) }
         standbyRestartRunnable = null
+    }
+
+    internal fun onOfflineWakeWordTriggered(matchedPhrase: String, confidence: Float) {
+        if (!isServiceRunning || isAssistantSpeaking || pausedForForegroundUi) return
+        Log.d(TAG, "Offline wake word '$matchedPhrase' triggered (conf=$confidence)")
+
+        // Release continuous AudioRecord stream immediately so SpeechRecognizer can capture command
+        alwaysOnWakeEngine?.stop()
+        isOurRecognizerRecording = false
+        resumeStandbyAfterCommand = true
+        isWakeStandbyActive = false
+
+        acquireShortWakeLock()
+        ActivationSoundPlayer.playActivationChime(applicationContext)
+
+        // If background activity launches are permitted (e.g. API < 29 or overlay granted), bring existing Siri UI forward
+        val canLaunchUi = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+            android.provider.Settings.canDrawOverlays(this)
+        if (canLaunchUi && !isScreenOff) {
+            try {
+                val uiIntent = Intent(this, MainActivity::class.java).apply {
+                    action = ACTION_TRIGGER_LISTEN
+                    putExtra(EXTRA_TRIGGER_LISTEN, true)
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }
+                startActivity(uiIntent)
+                updateNotification("$matchedPhrase detected • Siri UI active")
+                return
+            } catch (e: Exception) {
+                Log.d(TAG, "Foreground UI launch restricted by OS; running voice conversation in service", e)
+            }
+        }
+
+        updateNotification("$matchedPhrase detected • Listening for your command…")
+        startBackgroundSpeechCapture()
     }
 
     private fun handleBackgroundStandbyMatches(matches: List<String>, confidences: FloatArray?) {
@@ -1199,12 +1290,13 @@ class SiriVoiceService : Service() {
                 when (intent?.action) {
                     Intent.ACTION_SCREEN_OFF -> {
                         isScreenOff = true
+                        // Keep single continuous AudioRecord stream alive across screen-off whenever
+                        // Android/OEM permits (only stops if Doze activates or OS mutes hardware audio).
                         if (isServiceRunning && isWakeStandbyActive) {
-                            pausedDueToScreenLock = true
-                            cancelWakeStandbyRestart()
-                            isOurRecognizerRecording = false
-                            speechRecognizer?.cancel()
-                            updateNotification("Screen locked • Mic paused; unlock or tap 'Listen'")
+                            val wakeLabel = repository?.wakeWordOption?.value?.label ?: "Hey Siri"
+                            if (alwaysOnWakeEngine?.isListening() == true) {
+                                updateNotification("Screen Off Always-On • Say \"$wakeLabel\"")
+                            }
                         }
                     }
                     Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
@@ -1213,15 +1305,13 @@ class SiriVoiceService : Service() {
                         pausedDueToScreenLock = false
                         if (isServiceRunning && !pausedForForegroundUi && !pausedDueToAudioInterruption && !isDeviceInDoze()) {
                             pausedDueToDeviceIdle = false
-                            if (wasPausedByLock || isWakeStandbyActive) {
+                            if (wasPausedByLock || ((isWakeStandbyActive || repository?.backgroundWakeStandbyEnabled?.value == true) && alwaysOnWakeEngine?.isListening() != true)) {
                                 consecutiveErrorCount = 0
                                 consecutiveIdleCycles = 0
-                                speechRecognizer?.recreateRecognizer()
-                                if (isWakeStandbyActive || repository?.backgroundWakeStandbyEnabled?.value == true) {
-                                    isWakeStandbyActive = true
-                                    updateNotification("Hey Siri Standby Active • Say \"Hey Siri\"")
-                                    scheduleWakeStandbyRestart(350L)
-                                }
+                                startWakeWordStandbyMode()
+                            } else if (isWakeStandbyActive) {
+                                val wakeLabel = repository?.wakeWordOption?.value?.label ?: "Hey Siri"
+                                updateNotification("Always-On $wakeLabel • Say \"$wakeLabel\"")
                             }
                         }
                     }
@@ -1230,15 +1320,14 @@ class SiriVoiceService : Service() {
                         pausedDueToDeviceIdle = inDoze
                         if (inDoze && isServiceRunning && isWakeStandbyActive) {
                             cancelWakeStandbyRestart()
+                            alwaysOnWakeEngine?.stop()
                             isOurRecognizerRecording = false
                             speechRecognizer?.cancel()
                             updateNotification("Doze battery saver • Resumes when active")
-                        } else if (!inDoze && !isScreenOff && isServiceRunning && !pausedForForegroundUi && !pausedDueToAudioInterruption && isWakeStandbyActive) {
+                        } else if (!inDoze && isServiceRunning && !pausedForForegroundUi && !pausedDueToAudioInterruption && (isWakeStandbyActive || repository?.backgroundWakeStandbyEnabled?.value == true)) {
                             consecutiveErrorCount = 0
                             consecutiveIdleCycles = 0
-                            speechRecognizer?.recreateRecognizer()
-                            updateNotification("Hey Siri Standby Active • Say \"Hey Siri\"")
-                            scheduleWakeStandbyRestart(350L)
+                            startWakeWordStandbyMode()
                         }
                     }
                 }
@@ -1271,6 +1360,7 @@ class SiriVoiceService : Service() {
                         if (callOrMicBusy && !pausedDueToAudioInterruption) {
                             pausedDueToAudioInterruption = true
                             cancelWakeStandbyRestart()
+                            alwaysOnWakeEngine?.stop()
                             isOurRecognizerRecording = false
                             speechRecognizer?.cancel()
                             updateNotification("Paused during call / external mic use")
@@ -1279,9 +1369,7 @@ class SiriVoiceService : Service() {
                             if (!pausedForForegroundUi && !pausedDueToScreenLock && !pausedDueToDeviceIdle && isWakeStandbyActive) {
                                 consecutiveErrorCount = 0
                                 consecutiveIdleCycles = 0
-                                speechRecognizer?.recreateRecognizer()
-                                updateNotification("Hey Siri Standby Active • Say \"Hey Siri\"")
-                                scheduleWakeStandbyRestart(400L)
+                                startWakeWordStandbyMode()
                             }
                         }
                     }
@@ -1443,6 +1531,8 @@ class SiriVoiceService : Service() {
         }
 
         deviceController?.release()
+        alwaysOnWakeEngine?.stop()
+        alwaysOnWakeEngine = null
         speechRecognizer?.destroy()
         textToSpeech?.shutdown()
     }

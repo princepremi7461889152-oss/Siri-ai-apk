@@ -9,16 +9,21 @@ import android.view.KeyEvent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.BuildConfig
 import com.example.ai.AiBrainRepository
 import com.example.ai.EmotionEngine
 import com.example.ai.OfflineAssistantEngine
+import com.example.data.ApkInstallLaunchOutcome
+import com.example.data.AppUpdateManager
 import com.example.data.SiriRepository
+import com.example.data.UpdateCheckOutcome
 import com.example.device.AndroidDeviceController
 import com.example.device.AppLaunchOutcome
 import com.example.device.PermissionManager
 import com.example.device.PermissionStatusSnapshot
 import com.example.intent.SiriIntentParser
 import com.example.model.AppChoiceOption
+import com.example.model.AppUpdateState
 import com.example.model.AssistantEmotion
 import com.example.model.AssistantMode
 import com.example.model.AutomationRoutine
@@ -31,13 +36,19 @@ import com.example.model.LanguageOption
 import com.example.model.PendingConfirmation
 import com.example.model.ReminderItem
 import com.example.model.ReminderRepeat
+import com.example.model.UpdateInfo
 import com.example.model.VoiceGender
 import com.example.model.VoicePersonality
 import com.example.model.VoiceState
+import com.example.model.WakeWordOption
 import com.example.service.SiriNotificationListenerService
 import com.example.service.SiriVoiceService
+import com.example.voice.ActivationSoundPlayer
+import com.example.voice.AlwaysOnWakeWordEngine
 import com.example.voice.SiriSpeechRecognizer
 import com.example.voice.SiriTextToSpeech
+import com.example.voice.SoundTriggerCapabilityProbe
+import com.example.voice.WakeHardwareStatus
 import com.example.voice.WakeWordDetector
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -125,9 +136,20 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiEvents = MutableSharedFlow<String>()
     val uiEvents: SharedFlow<String> = _uiEvents.asSharedFlow()
 
-    // In-app update check state
+    // In-app GitHub Releases update state
+    private val defaultUpdateManager by lazy { AppUpdateManager(getApplication()) }
     private val _showUpdateDialog = MutableStateFlow(false)
     val showUpdateDialog: StateFlow<Boolean> = _showUpdateDialog.asStateFlow()
+
+    private val _appUpdateState = MutableStateFlow<AppUpdateState>(AppUpdateState.Idle)
+    val appUpdateState: StateFlow<AppUpdateState> = _appUpdateState.asStateFlow()
+
+    private val _wakeHardwareStatus = MutableStateFlow(SoundTriggerCapabilityProbe.probe(application))
+    val wakeHardwareStatus: StateFlow<WakeHardwareStatus> = _wakeHardwareStatus.asStateFlow()
+
+    private var uiAlwaysOnWakeEngine: AlwaysOnWakeWordEngine? = null
+    private var updateDownloadJob: Job? = null
+    private var hasAutoCheckedUpdateThisSession: Boolean = false
 
     // App disambiguation options when multiple installed apps match a spoken name
     private val _pendingAppChoices = MutableStateFlow<List<AppChoiceOption>>(emptyList())
@@ -209,6 +231,9 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         if (!snapshot.hasMicrophone && SiriVoiceService.isServiceRunning) {
             SiriVoiceService.stop(getApplication())
         }
+
+        // If user just returned after granting 'Install unknown apps', proceed to Android installer
+        retryPendingInstallIfPermitted()
     }
 
     fun requestPermissionIfNeeded(permission: String) {
@@ -285,6 +310,7 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         if (hadUiWakeStandby) {
             _isWakeWordStandby.value = false
             standbyRestartJob?.cancel()
+            uiAlwaysOnWakeEngine?.stop()
             repository.setBackgroundWakeStandbyEnabled(true)
         }
         if (_voiceState.value == VoiceState.LISTENING) {
@@ -381,6 +407,7 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
                 _voiceState.value = VoiceState.SPEAKING
             } else {
                 wakeWordDetector.markAssistantFinishedSpeaking()
+                uiAlwaysOnWakeEngine?.markAssistantFinishedSpeaking()
                 if (_voiceState.value == VoiceState.SPEAKING) {
                     _audioLevel.value = 0.08f
                     _voiceState.value = VoiceState.IDLE
@@ -391,7 +418,7 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
                             startListening()
                         }
                     } else if (_isWakeWordStandby.value) {
-                        scheduleWakeWordStandbyRestart(200L)
+                        ensureUiWakeEngineRunning()
                     } else if (repository.continuousListening.value) {
                         viewModelScope.launch {
                             delay(180)
@@ -527,14 +554,56 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun getOrCreateUiWakeEngine(): AlwaysOnWakeWordEngine {
+        val existing = uiAlwaysOnWakeEngine
+        if (existing != null) return existing
+        return AlwaysOnWakeWordEngine(
+            context = getApplication(),
+            onWakeDetected = { matchedPhrase, confidence ->
+                viewModelScope.launch(Dispatchers.Main.immediate) {
+                    handleOfflineWakeTriggeredInUi(matchedPhrase, confidence)
+                }
+            },
+            onHardwareError = { reason ->
+                viewModelScope.launch(Dispatchers.Main.immediate) {
+                    Log.w("SiriWake", "UI wake engine hardware notice: $reason")
+                    _wakeHardwareStatus.value = SoundTriggerCapabilityProbe.probe(getApplication())
+                }
+            }
+        ).also {
+            it.wakeWordOption = repository.wakeWordOption.value
+            uiAlwaysOnWakeEngine = it
+        }
+    }
+
+    private fun ensureUiWakeEngineRunning() {
+        if (!_isWakeWordStandby.value || !hasRecordAudioPermission()) return
+        val engine = getOrCreateUiWakeEngine().apply {
+            wakeWordOption = repository.wakeWordOption.value
+        }
+        if (!engine.isListening()) {
+            engine.start()
+        }
+    }
+
+    internal fun handleOfflineWakeTriggeredInUi(matchedPhrase: String, confidence: Float) {
+        if (!_isWakeWordStandby.value && _voiceState.value == VoiceState.LISTENING) return
+        Log.d("SiriWake", "Offline wake word '$matchedPhrase' triggered (conf=$confidence)")
+        uiAlwaysOnWakeEngine?.stop()
+        _isWakeWordStandby.value = false
+        standbyRestartJob?.cancel()
+        ActivationSoundPlayer.playActivationChime(getApplication())
+        viewModelScope.launch {
+            delay(120L)
+            startListening()
+        }
+    }
+
     private fun scheduleWakeWordStandbyRestart(delayMs: Long) {
         standbyRestartJob?.cancel()
         standbyRestartJob = viewModelScope.launch {
             delay(delayMs)
-            if (_isWakeWordStandby.value && _voiceState.value == VoiceState.IDLE) {
-                wakeWordDetector.resetUtteranceMetrics()
-                speechRecognizer?.startListening(standbyMode = true)
-            }
+            ensureUiWakeEngineRunning()
         }
     }
 
@@ -555,15 +624,21 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         stopAllSpeech()
+        _wakeHardwareStatus.value = SoundTriggerCapabilityProbe.probe(getApplication())
         _isWakeWordStandby.value = true
         wakeWordDetector.resetUtteranceMetrics()
-        speechRecognizer?.startListening(standbyMode = true)
+        // Single continuous low-CPU offline AudioRecord stream — no repeated mic ON/OFF restart loops
+        getOrCreateUiWakeEngine().apply {
+            wakeWordOption = repository.wakeWordOption.value
+            start()
+        }
     }
 
     fun stopWakeWordStandby() {
         _isWakeWordStandby.value = false
         repository.setBackgroundWakeStandbyEnabled(false)
         standbyRestartJob?.cancel()
+        uiAlwaysOnWakeEngine?.stop()
         speechRecognizer?.cancel()
         if (_voiceState.value == VoiceState.LISTENING) {
             _voiceState.value = VoiceState.IDLE
@@ -576,6 +651,11 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         } else {
             startWakeWordStandby()
         }
+    }
+
+    fun setWakeWordOption(option: WakeWordOption) {
+        repository.updateWakeWord(option)
+        uiAlwaysOnWakeEngine?.wakeWordOption = option
     }
 
     private fun initIntentParser() {
@@ -792,7 +872,9 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         if (SiriVoiceService.isServiceRunning) {
             SiriVoiceService.pauseForForegroundUi(getApplication())
         }
-        stopWakeWordStandby()
+        _isWakeWordStandby.value = false
+        standbyRestartJob?.cancel()
+        uiAlwaysOnWakeEngine?.stop()
         stopAllSpeech()
         _transcription.value = "Listening..."
         _voiceState.value = VoiceState.LISTENING
@@ -1546,9 +1628,165 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         _sleepTimerRemaining.value = 0
     }
 
-    // --- In-App Update Verification ---
-    fun checkForUpdates() {
-        _showUpdateDialog.value = true
+    // --- GitHub Releases In-App Version Update System ---
+    fun maybeAutoCheckForUpdates() {
+        if (hasAutoCheckedUpdateThisSession) return
+        if (!deviceController.isNetworkAvailable()) return
+        if (android.os.Build.FINGERPRINT.equals("robolectric", ignoreCase = true)) return
+        hasAutoCheckedUpdateThisSession = true
+        checkForUpdates(userInitiated = false)
+    }
+
+    fun checkForUpdates(
+        userInitiated: Boolean = true,
+        customManager: AppUpdateManager = defaultUpdateManager,
+        apiBaseUrl: String = "https://api.github.com"
+    ) {
+        if (!deviceController.isNetworkAvailable()) {
+            if (userInitiated) {
+                _appUpdateState.value = AppUpdateState.Error("No internet connection available to check for updates.")
+                _showUpdateDialog.value = true
+            }
+            return
+        }
+
+        _appUpdateState.value = AppUpdateState.Checking
+        if (userInitiated) {
+            _showUpdateDialog.value = true
+        }
+
+        viewModelScope.launch {
+            val outcome = customManager.checkForLatestRelease(
+                repoSlug = repository.getGithubUpdateRepo(),
+                currentVersionCode = BuildConfig.VERSION_CODE,
+                currentVersionName = BuildConfig.VERSION_NAME,
+                apiBaseUrl = apiBaseUrl
+            )
+            when (outcome) {
+                is UpdateCheckOutcome.UpdateAvailable -> {
+                    val info = outcome.updateInfo
+                    repository.updateUpdateInfo(info)
+                    _appUpdateState.value = AppUpdateState.UpdateAvailable(info)
+                    val dismissed = repository.getDismissedUpdateVersionCode()
+                    if (userInitiated || dismissed != info.latestVersionCode) {
+                        customManager.showUpdateAvailableNotification(info)
+                        _showUpdateDialog.value = true
+                    }
+                }
+                is UpdateCheckOutcome.UpToDate -> {
+                    val currentInfo = UpdateInfo(
+                        latestVersionCode = outcome.currentVersionCode,
+                        latestVersionName = outcome.currentVersionName,
+                        releaseNotes = "Siri AI is running the latest official release.",
+                        downloadUrl = "https://github.com/${repository.getGithubUpdateRepo()}/releases",
+                        releasePageUrl = "https://github.com/${repository.getGithubUpdateRepo()}/releases",
+                        isUpdateAvailable = false
+                    )
+                    repository.updateUpdateInfo(currentInfo)
+                    _appUpdateState.value = AppUpdateState.UpToDate(outcome.currentVersionCode, outcome.currentVersionName)
+                    // Never show unnecessary notifications or dialogs when already up to date unless user asked
+                    _showUpdateDialog.value = userInitiated
+                }
+                is UpdateCheckOutcome.Error -> {
+                    _appUpdateState.value = AppUpdateState.Error(outcome.message)
+                    if (userInitiated) {
+                        _showUpdateDialog.value = true
+                    } else {
+                        _appUpdateState.value = AppUpdateState.Idle
+                    }
+                }
+            }
+        }
+    }
+
+    fun openAvailableUpdateDialogIfNeeded() {
+        val currentState = _appUpdateState.value
+        if (currentState is AppUpdateState.UpdateAvailable ||
+            currentState is AppUpdateState.Downloading ||
+            currentState is AppUpdateState.Verifying ||
+            currentState is AppUpdateState.ReadyToInstall ||
+            currentState is AppUpdateState.PermissionNeeded
+        ) {
+            _showUpdateDialog.value = true
+        } else {
+            checkForUpdates(userInitiated = true)
+        }
+    }
+
+    fun startDownloadAndInstallUpdate(customManager: AppUpdateManager = defaultUpdateManager) {
+        val info = when (val st = _appUpdateState.value) {
+            is AppUpdateState.UpdateAvailable -> st.info
+            is AppUpdateState.Error -> st.info ?: repository.updateInfo.value
+            else -> repository.updateInfo.value
+        }
+        if (!info.isUpdateAvailable || info.downloadUrl.isBlank()) {
+            _appUpdateState.value = AppUpdateState.Error("No valid APK download URL found for this release.", info)
+            return
+        }
+
+        updateDownloadJob?.cancel()
+        updateDownloadJob = viewModelScope.launch {
+            _appUpdateState.value = AppUpdateState.Downloading(0f, info)
+            val result = customManager.downloadAndVerifyApk(info) { progress ->
+                if (progress >= 0.999f) {
+                    _appUpdateState.value = AppUpdateState.Verifying(info)
+                } else {
+                    _appUpdateState.value = AppUpdateState.Downloading(progress, info)
+                }
+            }
+            result.fold(
+                onSuccess = { verifiedApk ->
+                    _appUpdateState.value = AppUpdateState.ReadyToInstall(verifiedApk.absolutePath, info)
+                    when (val launchOutcome = customManager.launchOfficialPackageInstaller(verifiedApk)) {
+                        ApkInstallLaunchOutcome.LaunchedInstaller -> {
+                            _showUpdateDialog.value = false
+                        }
+                        ApkInstallLaunchOutcome.UnknownSourcesPermissionNeeded -> {
+                            _appUpdateState.value = AppUpdateState.PermissionNeeded(verifiedApk.absolutePath, info)
+                        }
+                        is ApkInstallLaunchOutcome.Failed -> {
+                            _appUpdateState.value = AppUpdateState.Error(launchOutcome.reason, info)
+                        }
+                    }
+                },
+                onFailure = { err ->
+                    _appUpdateState.value = AppUpdateState.Error(
+                        err.localizedMessage ?: "Failed to download or verify update APK.",
+                        info
+                    )
+                }
+            )
+        }
+    }
+
+    private fun retryPendingInstallIfPermitted() {
+        val st = _appUpdateState.value
+        if (st is AppUpdateState.PermissionNeeded &&
+            (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O ||
+                getApplication<Application>().packageManager.canRequestPackageInstalls())
+        ) {
+            val file = java.io.File(st.apkPath)
+            if (file.exists()) {
+                when (val outcome = defaultUpdateManager.launchOfficialPackageInstaller(file)) {
+                    ApkInstallLaunchOutcome.LaunchedInstaller -> {
+                        _appUpdateState.value = AppUpdateState.ReadyToInstall(st.apkPath, st.info)
+                        _showUpdateDialog.value = false
+                    }
+                    is ApkInstallLaunchOutcome.Failed -> {
+                        _appUpdateState.value = AppUpdateState.Error(outcome.reason, st.info)
+                    }
+                    else -> Unit
+                }
+            }
+        }
+    }
+
+    fun dismissUpdateLater() {
+        val info = repository.updateInfo.value
+        if (info.isUpdateAvailable) {
+            repository.dismissUpdateForVersion(info.latestVersionCode)
+        }
+        _showUpdateDialog.value = false
     }
 
     fun dismissUpdateDialog() {
@@ -1569,6 +1807,7 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         unregisterConnectivityCallback?.invoke()
+        uiAlwaysOnWakeEngine?.stop()
         deviceController.release()
         textToSpeech?.shutdown()
         speechRecognizer?.destroy()
@@ -1576,6 +1815,7 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         sleepTimerJob?.cancel()
         sessionTimeoutJob?.cancel()
         standbyRestartJob?.cancel()
+        updateDownloadJob?.cancel()
         aiJob?.cancel()
     }
 }

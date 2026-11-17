@@ -79,8 +79,22 @@ jobs:
             fi
           fi
 
+      - name: Compute release version metadata
+        id: version_meta
+        run: |
+          RUN_NUM="${GITHUB_RUN_NUMBER:-1}"
+          NEW_VERSION_CODE=$((3 + RUN_NUM))
+          NEW_VERSION_NAME="1.2.${RUN_NUM}"
+          echo "version_code=$NEW_VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=$NEW_VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "Computed Release Version: v${NEW_VERSION_NAME} (versionCode=${NEW_VERSION_CODE})"
+
       - name: Build the debug APK
-        run: gradle :app:assembleDebug --stacktrace --no-daemon
+        run: >
+          gradle :app:assembleDebug --stacktrace --no-daemon
+          -PappVersionCode=${{ steps.version_meta.outputs.version_code }}
+          -PappVersionName=${{ steps.version_meta.outputs.version_name }}
+          -PgithubUpdateRepo=${{ github.repository }}
 
       - name: Verify the APK
         id: verify_apk
@@ -104,7 +118,9 @@ jobs:
             *.apk) ;;
             *) echo "Error: Expected APK file does not have .apk extension."; exit 1 ;;
           esac
-          echo "APK successfully verified: $EXPECTED_APK ($(stat -c%s "$EXPECTED_APK") bytes)"
+          APK_SHA256=$(sha256sum "$EXPECTED_APK" | awk '{print $1}')
+          echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "APK successfully verified: $EXPECTED_APK ($(stat -c%s "$EXPECTED_APK") bytes, sha256=$APK_SHA256)"
 
       - name: Upload debug APK artifact
         id: upload_artifact
@@ -114,19 +130,24 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
-      - name: Prepare APK release asset
+      - name: Prepare APK and SHA-256 release assets
         id: prepare_asset
         run: |
           RELEASE_DIR=$(mktemp -d)
           SOURCE_APK="app/build/outputs/apk/debug/app-debug.apk"
           RELEASE_FILE="$RELEASE_DIR/app-debug.apk"
+          CHECKSUM_FILE="$RELEASE_DIR/app-debug.apk.sha256"
           cp "$SOURCE_APK" "$RELEASE_FILE"
           if [ ! -f "$RELEASE_FILE" ] || [ ! -s "$RELEASE_FILE" ]; then
             echo "Error: Failed to prepare release asset at $RELEASE_FILE"
             exit 1
           fi
+          APK_SHA256=$(sha256sum "$RELEASE_FILE" | awk '{print $1}')
+          echo "${APK_SHA256}  app-debug.apk" > "$CHECKSUM_FILE"
           echo "apk_path=$RELEASE_FILE" >> "$GITHUB_OUTPUT"
-          echo "Prepared APK release asset at: $RELEASE_FILE"
+          echo "checksum_path=$CHECKSUM_FILE" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=$APK_SHA256" >> "$GITHUB_OUTPUT"
+          echo "Prepared APK release asset at: $RELEASE_FILE (sha256=$APK_SHA256)"
 
       - name: Publish APK to GitHub Releases
         id: publish_release
@@ -138,39 +159,40 @@ jobs:
           gh --version
 
           ASSET_PATH="${{ steps.prepare_asset.outputs.apk_path }}"
-          if [ ! -f "$ASSET_PATH" ]; then
-            echo "Error: Prepared asset $ASSET_PATH not found."
+          CHECKSUM_PATH="${{ steps.prepare_asset.outputs.checksum_path }}"
+          APK_SHA256="${{ steps.prepare_asset.outputs.apk_sha256 }}"
+          VERSION_CODE="${{ steps.version_meta.outputs.version_code }}"
+          VERSION_NAME="${{ steps.version_meta.outputs.version_name }}"
+
+          if [ ! -f "$ASSET_PATH" ] || [ ! -s "$ASSET_PATH" ]; then
+            echo "Error: Prepared asset $ASSET_PATH missing or empty."
             exit 1
           fi
-          if [ ! -s "$ASSET_PATH" ]; then
-            echo "Error: Prepared asset $ASSET_PATH is empty."
+          if [ ! -f "$CHECKSUM_PATH" ] || [ ! -s "$CHECKSUM_PATH" ]; then
+            echo "Error: Checksum asset $CHECKSUM_PATH missing or empty."
             exit 1
           fi
-          case "$ASSET_PATH" in
-            *.apk) ;;
-            *) echo "Error: Prepared asset does not end in .apk."; exit 1 ;;
-          esac
           if [ "$(basename "$ASSET_PATH")" != "app-debug.apk" ]; then
             echo "Error: Prepared asset filename must be app-debug.apk."
             exit 1
           fi
 
-          RELEASE_TAG="debug-apk-build-${{ github.run_number }}-${{ github.run_attempt }}"
-          RELEASE_TITLE="Debug APK Build #${{ github.run_number }}"
+          RELEASE_TAG="v${VERSION_NAME}+${VERSION_CODE}"
+          RELEASE_TITLE="Siri AI Assistant v${VERSION_NAME} (Build ${VERSION_CODE})"
 
           RELEASE_NOTES="$(printf '%s\n' \
-            '### Automated Debug APK Build' \
+            '### Siri AI Assistant Official Build' \
             '' \
-            '- **Type**: Automatically generated debug APK' \
-            '- **Builder**: GitHub Actions' \
-            "- **Run Number**: ${{ github.run_number }}" \
-            "- **Run Attempt**: ${{ github.run_attempt }}" \
+            "- **Version Name**: ${VERSION_NAME}" \
+            "- **Version Code**: ${VERSION_CODE}" \
+            "- **SHA-256**: ${APK_SHA256}" \
             "- **Commit SHA**: ${{ github.sha }}" \
-            '- **Usage**: Intended for testing only. Not a Play Store production release.' \
-            '- **Signing**: Signed only with a temporary debug keystore.')"
+            "- **Run Number**: ${{ github.run_number }}" \
+            '' \
+            'Includes always-on offline wake word detection ("Hey Siri" / "Siri"), background foreground service lifecycle stability, and SHA-256 verified in-app updates.')"
 
           echo "Publishing GitHub Release: $RELEASE_TAG"
-          gh release create "$RELEASE_TAG" "$ASSET_PATH" \
+          gh release create "$RELEASE_TAG" "$ASSET_PATH" "$CHECKSUM_PATH" \
             --title "$RELEASE_TITLE" \
             --notes "$RELEASE_NOTES" \
             --target "${{ github.sha }}" \
@@ -181,8 +203,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RELEASE_TAG="debug-apk-build-${{ github.run_number }}-${{ github.run_attempt }}"
-          RELEASE_TITLE="Debug APK Build #${{ github.run_number }}"
+          VERSION_CODE="${{ steps.version_meta.outputs.version_code }}"
+          VERSION_NAME="${{ steps.version_meta.outputs.version_name }}"
+          RELEASE_TAG="v${VERSION_NAME}+${VERSION_CODE}"
+          RELEASE_TITLE="Siri AI Assistant v${VERSION_NAME} (Build ${VERSION_CODE})"
           DIRECT_URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/app-debug.apk"
 
           if [ "${{ steps.publish_release.outcome }}" = "success" ]; then
@@ -194,20 +218,19 @@ jobs:
             echo "Release Title: $RELEASE_TITLE"
             echo "Release Page URL: $RELEASE_URL"
             echo "APK Filename: app-debug.apk"
+            echo "APK SHA-256: ${{ steps.prepare_asset.outputs.apk_sha256 }}"
             echo "Direct Download URL: $DIRECT_URL"
-            echo "Actions artifact 'app-debug-apk' remains available as a backup."
             echo "=========================================="
 
             echo "### DIRECT APK DOWNLOAD" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "[$DIRECT_URL]($DIRECT_URL)" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "The normal Actions artifact \`app-debug-apk\` remains available as a backup." >> "$GITHUB_STEP_SUMMARY"
+            echo "- Release: **${RELEASE_TITLE}**" >> "$GITHUB_STEP_SUMMARY"
+            echo "- SHA-256: \`${{ steps.prepare_asset.outputs.apk_sha256 }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Download: [$DIRECT_URL]($DIRECT_URL)" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::warning ::GitHub Release publishing failed or did not run."
             if [ "${{ steps.verify_apk.outcome }}" = "success" ] && [ "${{ steps.upload_artifact.outcome }}" = "success" ]; then
               echo "The APK build succeeded and the backup Actions artifact 'app-debug-apk' remains available."
-              echo "Note: The new APK is NOT available through the direct latest-release link because release publishing failed."
               echo "### DIRECT APK DOWNLOAD (RELEASE FAILED)" >> "$GITHUB_STEP_SUMMARY"
               echo "> APK build succeeded. The normal Actions artifact \`app-debug-apk\` remains available as a backup." >> "$GITHUB_STEP_SUMMARY"
             else
