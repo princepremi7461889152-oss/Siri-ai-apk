@@ -36,6 +36,18 @@ class SiriTextToSpeech(
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                if (isCurrentlySpeaking) {
+                    Log.d("SiriTTS", "Yielding TTS speech due to audio focus loss: $focusChange")
+                    stop()
+                }
+            }
+        }
+    }
 
     private var currentPersonality: VoicePersonality = VoicePersonality.FRIENDLY
     private var currentVoiceGender: VoiceGender = VoiceGender.FEMALE
@@ -416,14 +428,14 @@ class SiriTextToSpeech(
                 val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                     .setAudioAttributes(playbackAttributes)
                     .setAcceptsDelayedFocusGain(true)
-                    .setOnAudioFocusChangeListener { }
+                    .setOnAudioFocusChangeListener(audioFocusChangeListener)
                     .build()
                 audioFocusRequest = focusRequest
                 am.requestAudioFocus(focusRequest)
             } else {
                 @Suppress("DEPRECATION")
                 am.requestAudioFocus(
-                    null,
+                    audioFocusChangeListener,
                     AudioManager.STREAM_MUSIC,
                     AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
                 )
@@ -440,7 +452,7 @@ class SiriTextToSpeech(
                 audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
             } else {
                 @Suppress("DEPRECATION")
-                am.abandonAudioFocus(null)
+                am.abandonAudioFocus(audioFocusChangeListener)
             }
         } catch (e: Exception) {
             Log.e("SiriTTS", "Error abandoning audio focus", e)

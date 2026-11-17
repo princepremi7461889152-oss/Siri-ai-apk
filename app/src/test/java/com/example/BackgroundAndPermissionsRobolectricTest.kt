@@ -6,10 +6,13 @@ import android.app.Application
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.media.AudioManager
+import android.os.PowerManager
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.SiriRepository
 import com.example.device.BootReceiver
@@ -19,7 +22,6 @@ import com.example.service.SiriVoiceService
 import com.example.ui.screens.PrivacyScreen
 import com.example.ui.theme.SiriAITheme
 import com.example.viewmodel.SiriViewModel
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
@@ -233,17 +235,115 @@ class BackgroundAndPermissionsRobolectricTest {
             }
         }
 
-        composeTestRule.onNodeWithTag("perm_status_microphone").assertTextEquals("Granted")
-        composeTestRule.onNodeWithTag("perm_status_contacts").assertTextEquals("Not Granted")
-        composeTestRule.onNodeWithTag("perm_status_notifications").assertTextEquals("Not Granted")
-        composeTestRule.onNodeWithTag("perm_status_background_service").assertTextEquals("Inactive")
-        composeTestRule.onNodeWithTag("perm_action_contacts").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("perm_status_microphone").performScrollTo().assertTextEquals("Granted")
+        composeTestRule.onNodeWithTag("perm_status_contacts").performScrollTo().assertTextEquals("Not Granted")
+        composeTestRule.onNodeWithTag("perm_status_notifications").performScrollTo().assertTextEquals("Not Granted")
+        composeTestRule.onNodeWithTag("perm_status_exact_alarms").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("perm_status_background_service").performScrollTo().assertTextEquals("Inactive")
+        composeTestRule.onNodeWithTag("perm_status_battery_opt").performScrollTo().assertIsDisplayed()
+        composeTestRule.onNodeWithTag("perm_action_contacts").performScrollTo().assertIsDisplayed()
 
         // Simulate granting contacts in Settings + returning to app
         shadowOf(app).grantPermissions(Manifest.permission.READ_CONTACTS)
         viewModel.refreshPermissionStatus()
         composeTestRule.waitForIdle()
 
-        composeTestRule.onNodeWithTag("perm_status_contacts").assertTextEquals("Granted")
+        composeTestRule.onNodeWithTag("perm_status_contacts").performScrollTo().assertTextEquals("Granted")
+    }
+
+    @Test
+    fun testRevokingGrantedPermissionDoesNotTriggerFalsePermanentDenialAndStopsMicService() = runTest(UnconfinedTestDispatcher()) {
+        shadowOf(app).grantPermissions(Manifest.permission.RECORD_AUDIO)
+        val viewModel = SiriViewModel(app)
+        val emitted = mutableListOf<String>()
+        val job = launch {
+            viewModel.permissionRequestEvents.collect { emitted.add(it) }
+        }
+
+        // First prompt recorded while granted (or after granting in Settings)
+        viewModel.onPermissionResult(Manifest.permission.RECORD_AUDIO, granted = true)
+        assertFalse(viewModel.repository.wasPermissionDeniedBefore(Manifest.permission.RECORD_AUDIO))
+
+        // Activate background FGS while permission is valid -> emits Android 13+ POST_NOTIFICATIONS once
+        viewModel.setBackgroundVoiceServiceEnabled(true)
+        assertTrue(viewModel.repository.backgroundServiceEnabled.value)
+        assertEquals(listOf(Manifest.permission.POST_NOTIFICATIONS), emitted)
+        emitted.clear()
+
+        // Verify ViewModel ON_START -> ON_PAUSE -> ON_STOP lifecycle transitions keep FGS ready
+        SiriVoiceService.isServiceRunning = true
+        viewModel.onAppForegrounded()
+        viewModel.onAppPausing()
+        viewModel.onAppBackgrounded()
+        assertTrue(SiriVoiceService.isServiceRunning)
+
+        // Manually revoke RECORD_AUDIO in Android Settings & resume app
+        shadowOf(app).denyPermissions(Manifest.permission.RECORD_AUDIO)
+        viewModel.refreshPermissionStatus()
+
+        assertFalse(viewModel.permissionStatus.value.hasMicrophone)
+        // Must still NOT falsely mark as previously denied!
+        assertFalse(viewModel.repository.wasPermissionDeniedBefore(Manifest.permission.RECORD_AUDIO))
+
+        // On-demand feature request after manual revocation emits a fresh permission request
+        viewModel.requestPermissionIfNeeded(Manifest.permission.RECORD_AUDIO)
+        assertEquals(listOf(Manifest.permission.RECORD_AUDIO), emitted)
+
+        // If user now explicitly denies it, denial tracking flips true
+        viewModel.onPermissionResult(Manifest.permission.RECORD_AUDIO, granted = false)
+        assertTrue(viewModel.repository.wasPermissionDeniedBefore(Manifest.permission.RECORD_AUDIO))
+
+        job.cancel()
+    }
+
+    @Test
+    fun testServiceHandlesAudioCallDozeScreenEventsAndTaskRemoval() {
+        shadowOf(app).grantPermissions(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.POST_NOTIFICATIONS
+        )
+        val controller = Robolectric.buildService(
+            SiriVoiceService::class.java,
+            Intent(app, SiriVoiceService::class.java).apply {
+                action = SiriVoiceService.ACTION_START_WAKE_STANDBY
+            }
+        ).create().startCommand(0, 1)
+
+        val service = controller.get()
+        assertTrue(SiriVoiceService.isServiceRunning)
+        assertTrue(SiriVoiceService.isWakeStandbyActive)
+
+        // Simulate Doze mode enter -> screen off -> Doze exit -> unlock recovery
+        val pm = app.getSystemService(Context.POWER_SERVICE) as PowerManager
+        shadowOf(pm).setIsDeviceIdleMode(true)
+        app.sendBroadcast(Intent(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED))
+        app.sendBroadcast(Intent(Intent.ACTION_SCREEN_OFF))
+        assertTrue(SiriVoiceService.isServiceRunning)
+
+        shadowOf(pm).setIsDeviceIdleMode(false)
+        app.sendBroadcast(Intent(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED))
+        app.sendBroadcast(Intent(Intent.ACTION_SCREEN_ON))
+        app.sendBroadcast(Intent(Intent.ACTION_USER_PRESENT))
+        Robolectric.flushForegroundThreadScheduler()
+        assertTrue(SiriVoiceService.isServiceRunning)
+
+        // External audio/call mode interruption handled cleanly without stopping FGS
+        val am = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        am.mode = AudioManager.MODE_IN_CALL
+        app.sendBroadcast(Intent(Intent.ACTION_SCREEN_OFF))
+        app.sendBroadcast(Intent(Intent.ACTION_USER_PRESENT))
+        Robolectric.flushForegroundThreadScheduler()
+        assertTrue(SiriVoiceService.isServiceRunning)
+        am.mode = AudioManager.MODE_NORMAL
+
+        // Swiping app from Recents keeps FGS notification alive when enabled
+        service.onTaskRemoved(Intent(app, MainActivity::class.java))
+        assertTrue(SiriVoiceService.isServiceRunning)
+
+        controller.withIntent(
+            Intent(app, SiriVoiceService::class.java).apply { action = SiriVoiceService.ACTION_STOP }
+        ).startCommand(0, 2)
+        assertFalse(SiriVoiceService.isServiceRunning)
+        controller.destroy()
     }
 }

@@ -130,7 +130,8 @@
         <service
             android:name=".service.SiriVoiceService"
             android:exported="false"
-            android:foregroundServiceType="microphone" />
+            android:foregroundServiceType="microphone"
+            android:stopWithTask="false" />
 
         <!-- Notification listener for reading/summarizing permitted notifications -->
         <service

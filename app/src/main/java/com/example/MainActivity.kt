@@ -142,6 +142,7 @@ fun MainContent(viewModel: SiriViewModel) {
             when (event) {
                 Lifecycle.Event.ON_START -> viewModel.onAppForegrounded()
                 Lifecycle.Event.ON_RESUME -> viewModel.refreshPermissionStatus()
+                Lifecycle.Event.ON_PAUSE -> viewModel.onAppPausing()
                 Lifecycle.Event.ON_STOP -> viewModel.onAppBackgrounded()
                 else -> Unit
             }
@@ -165,12 +166,12 @@ fun MainContent(viewModel: SiriViewModel) {
                 return@collect
             }
             val shouldShowRationale = PermissionManager.shouldShowRationale(activity, permission)
-            val alreadyPrompted = viewModel.repository.hasPermissionBeenPrompted(permission)
+            val deniedBefore = viewModel.repository.wasPermissionDeniedBefore(permission)
             when {
                 shouldShowRationale -> {
                     rationalePermission = permission
                 }
-                alreadyPrompted && !shouldShowRationale -> {
+                deniedBefore && !shouldShowRationale -> {
                     permanentlyDeniedPermission = permission
                 }
                 else -> {

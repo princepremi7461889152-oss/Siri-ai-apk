@@ -275,13 +275,21 @@ class SiriRepository(private val context: Context) {
         prefs.edit().putBoolean("background_wake_standby_enabled", enabled).apply()
     }
 
-    // --- Permission Setup Tracking (tracks whether we prompted before; NEVER caches granted status) ---
+    // --- Permission Setup Tracking (tracks whether we prompted/denied before; NEVER caches granted status) ---
     fun hasPermissionBeenPrompted(permission: String): Boolean {
         return prefs.getBoolean("perm_prompted_$permission", false)
     }
 
     fun markPermissionPrompted(permission: String) {
-        prefs.edit().putBoolean("perm_prompted_$permission", true).apply()
+        prefs.edit().putBoolean("perm_prompted_$permission", true).commit()
+    }
+
+    fun wasPermissionDeniedBefore(permission: String): Boolean {
+        return prefs.getBoolean("perm_denied_$permission", false)
+    }
+
+    fun setPermissionDeniedBefore(permission: String, denied: Boolean) {
+        prefs.edit().putBoolean("perm_denied_$permission", denied).commit()
     }
 
     fun isInitialPermissionSetupDone(): Boolean {
@@ -289,7 +297,7 @@ class SiriRepository(private val context: Context) {
     }
 
     fun markInitialPermissionSetupDone() {
-        prefs.edit().putBoolean("perm_initial_setup_done", true).apply()
+        prefs.edit().putBoolean("perm_initial_setup_done", true).commit()
     }
 
     // --- User Preferences Memory ---

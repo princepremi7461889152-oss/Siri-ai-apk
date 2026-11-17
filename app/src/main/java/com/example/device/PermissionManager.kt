@@ -165,4 +165,26 @@ object PermissionManager {
         }
         openAppSettings(context)
     }
+
+    /**
+     * Provides device-specific battery / Doze / background restriction instructions
+     * without forcing users to disable Android security protections.
+     */
+    fun getManufacturerBatteryGuidance(): Pair<String, String> {
+        val mfg = Build.MANUFACTURER.orEmpty().lowercase()
+        return when {
+            mfg.contains("xiaomi") || mfg.contains("redmi") || mfg.contains("poco") ->
+                "Xiaomi / MIUI / HyperOS" to "Open Settings -> Apps -> Siri AI -> Battery saver -> select 'No restrictions', and enable Autostart if you want standby to persist."
+            mfg.contains("samsung") ->
+                "Samsung One UI" to "Open Settings -> Apps -> Siri AI -> Battery -> select 'Unrestricted', and ensure Siri AI is not in Sleeping or Deep Sleeping apps."
+            mfg.contains("oneplus") || mfg.contains("oppo") || mfg.contains("realme") ->
+                "OnePlus / Oppo / Realme" to "Open App Info -> Battery usage -> allow Background activity and disable Optimize battery use for uninterrupted voice standby."
+            mfg.contains("vivo") || mfg.contains("iqoo") ->
+                "Vivo / iQOO" to "Open Settings -> Battery -> Background power consumption management -> allow Siri AI high background power usage."
+            mfg.contains("huawei") || mfg.contains("honor") ->
+                "Huawei / Honor" to "Open Settings -> Battery -> App launch -> switch Siri AI to Manage manually with Background activity enabled."
+            else ->
+                "Android Battery & Doze" to "Open Settings -> Apps -> Siri AI -> App battery usage -> choose 'Unrestricted' if Doze pauses the assistant while locked."
+        }
+    }
 }

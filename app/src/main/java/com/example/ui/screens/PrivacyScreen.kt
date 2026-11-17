@@ -593,10 +593,11 @@ fun PrivacyScreen(
                     onActionClick = { viewModel.setBackgroundVoiceServiceEnabled(!isBackgroundServiceActive) }
                 )
 
-                // Battery Optimization Guidance
+                // Battery Optimization Guidance (includes OEM-specific steps for Android 13+)
+                val (oemName, oemSteps) = remember { PermissionManager.getManufacturerBatteryGuidance() }
                 PermissionAuditCard(
                     title = "Battery Optimization",
-                    purpose = "Set to Unrestricted if your device stops background assistant after screen lock.",
+                    purpose = "$oemName: $oemSteps",
                     statusLabel = if (isIgnoringBatteryOpt) "Available" else "Restricted",
                     isGranted = isIgnoringBatteryOpt,
                     actionLabel = "Settings",
