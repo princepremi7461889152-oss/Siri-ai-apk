@@ -2,10 +2,7 @@ package com.example.ui.screens
 
 import android.Manifest
 import android.content.Context
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.provider.Settings
+import android.os.Build
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Alarm
+import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDone
@@ -32,12 +30,12 @@ import androidx.compose.material.icons.filled.Contacts
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -54,6 +52,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -69,8 +68,10 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
-import com.example.service.SiriNotificationListenerService
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.device.PermissionManager
 import com.example.ui.theme.SiriCyan
 import com.example.ui.theme.SiriDarkBackground
 import com.example.ui.theme.SiriDarkSurface
@@ -87,8 +88,10 @@ fun PrivacyScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val userPrefs by viewModel.repository.userPreferences.collectAsState()
     val memories by viewModel.repository.memories.collectAsState()
+    val permissionStatus by viewModel.permissionStatus.collectAsState()
 
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
     var showWipeAllConfirmDialog by remember { mutableStateOf(false) }
@@ -101,24 +104,25 @@ fun PrivacyScreen(
     var editHome by remember(userPrefs.homeLocation) { mutableStateOf(userPrefs.homeLocation) }
     var editWork by remember(userPrefs.workLocation) { mutableStateOf(userPrefs.workLocation) }
 
-    val hasMicPermission = ContextCompat.checkSelfPermission(
-        context,
-        Manifest.permission.RECORD_AUDIO
-    ) == PackageManager.PERMISSION_GRANTED
+    DisposableEffect(lifecycleOwner, viewModel) {
+        viewModel.refreshPermissionStatus()
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.refreshPermissionStatus()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
-    val hasCameraPermission = ContextCompat.checkSelfPermission(
-        context,
-        Manifest.permission.CAMERA
-    ) == PackageManager.PERMISSION_GRANTED
-
-    val hasContactsPermission = ContextCompat.checkSelfPermission(
-        context,
-        Manifest.permission.READ_CONTACTS
-    ) == PackageManager.PERMISSION_GRANTED
-
-    val hasExactAlarmPermission = viewModel.deviceController.reminderScheduler.canScheduleExactAlarms()
-
-    val isNotifListenerActive = SiriNotificationListenerService.isConnected
+    val hasMicPermission = permissionStatus.hasMicrophone
+    val hasNotificationsPermission = permissionStatus.hasNotifications
+    val hasCameraPermission = permissionStatus.hasCamera
+    val hasContactsPermission = permissionStatus.hasContacts
+    val hasExactAlarmPermission = permissionStatus.hasExactAlarms
+    val isNotifListenerActive = permissionStatus.hasNotificationListener
+    val isBackgroundServiceActive = permissionStatus.isBackgroundServiceActive
+    val isIgnoringBatteryOpt = permissionStatus.isIgnoringBatteryOptimizations
 
     val scrollState = rememberScrollState()
 
@@ -506,9 +510,9 @@ fun PrivacyScreen(
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // Permissions Status Audit
+            // Permissions & Background Service Dashboard
             Text(
-                text = "Android System Permissions Audit",
+                text = "Permissions & Background Service Status",
                 color = SiriTextPrimary,
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Bold
@@ -519,52 +523,113 @@ fun PrivacyScreen(
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 // Microphone
                 PermissionAuditCard(
-                    title = "Microphone Permission",
-                    purpose = "Used exclusively for voice recognition when you activate Siri.",
+                    title = "Microphone",
+                    purpose = "Used for voice commands when you activate Siri or enable Background Service.",
+                    statusLabel = if (hasMicPermission) "Granted" else "Not Granted",
                     isGranted = hasMicPermission,
+                    actionLabel = "Grant",
                     icon = Icons.Default.Mic,
-                    onOpenSettings = { openAppSettings(context) }
+                    statusTestTag = "perm_status_microphone",
+                    actionTestTag = "perm_action_microphone",
+                    onActionClick = { viewModel.requestPermissionIfNeeded(Manifest.permission.RECORD_AUDIO) }
                 )
 
-                // Camera & Flashlight
+                // Notifications
                 PermissionAuditCard(
-                    title = "Camera & Flashlight",
-                    purpose = "Used to control the torch and capture photos for Vision AI analysis.",
-                    isGranted = hasCameraPermission,
-                    icon = Icons.Default.CameraAlt,
-                    onOpenSettings = { openAppSettings(context) }
+                    title = "Notifications",
+                    purpose = "Required on Android 13+ for the ongoing background assistant control and reminder alerts.",
+                    statusLabel = if (hasNotificationsPermission) "Granted" else "Not Granted",
+                    isGranted = hasNotificationsPermission,
+                    actionLabel = "Grant",
+                    icon = Icons.Default.NotificationsActive,
+                    statusTestTag = "perm_status_notifications",
+                    actionTestTag = "perm_action_notifications",
+                    onActionClick = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            viewModel.requestPermissionIfNeeded(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            PermissionManager.openNotificationSettings(context)
+                        }
+                    }
+                )
+
+                // Contacts Permission
+                PermissionAuditCard(
+                    title = "Contacts",
+                    purpose = "Optional: lets Siri find contacts by name before confirmed calls or messages.",
+                    statusLabel = if (hasContactsPermission) "Granted" else "Not Granted",
+                    isGranted = hasContactsPermission,
+                    actionLabel = "Grant",
+                    icon = Icons.Default.Contacts,
+                    statusTestTag = "perm_status_contacts",
+                    actionTestTag = "perm_action_contacts",
+                    onActionClick = { viewModel.requestPermissionIfNeeded(Manifest.permission.READ_CONTACTS) }
+                )
+
+                // Exact Alarms Permission
+                PermissionAuditCard(
+                    title = "Exact Alarms",
+                    purpose = "Ensures scheduled and recurring voice reminders fire on the exact minute.",
+                    statusLabel = if (hasExactAlarmPermission) "Available" else "Restricted",
+                    isGranted = hasExactAlarmPermission,
+                    actionLabel = "Enable",
+                    icon = Icons.Default.Alarm,
+                    statusTestTag = "perm_status_exact_alarms",
+                    actionTestTag = "perm_action_exact_alarms",
+                    onActionClick = { viewModel.deviceController.reminderScheduler.openExactAlarmPermissionSettings() }
+                )
+
+                // Background Service Status
+                PermissionAuditCard(
+                    title = "Background Service",
+                    purpose = "Keeps Siri available from notification bar and wake standby across apps and lock screen.",
+                    statusLabel = if (isBackgroundServiceActive) "Active" else "Inactive",
+                    isGranted = isBackgroundServiceActive,
+                    actionLabel = if (isBackgroundServiceActive) "Stop" else "Start",
+                    showActionWhenGranted = true,
+                    icon = Icons.Default.GraphicEq,
+                    statusTestTag = "perm_status_background_service",
+                    actionTestTag = "perm_action_background_service",
+                    onActionClick = { viewModel.setBackgroundVoiceServiceEnabled(!isBackgroundServiceActive) }
+                )
+
+                // Battery Optimization Guidance
+                PermissionAuditCard(
+                    title = "Battery Optimization",
+                    purpose = "Set to Unrestricted if your device stops background assistant after screen lock.",
+                    statusLabel = if (isIgnoringBatteryOpt) "Available" else "Restricted",
+                    isGranted = isIgnoringBatteryOpt,
+                    actionLabel = "Settings",
+                    icon = Icons.Default.BatteryChargingFull,
+                    statusTestTag = "perm_status_battery_opt",
+                    actionTestTag = "perm_action_battery_opt",
+                    onActionClick = { PermissionManager.openBatteryOptimizationSettings(context) }
                 )
 
                 // Notifications Listener
                 PermissionAuditCard(
                     title = "Notification Listener",
                     purpose = "Optional: enables Siri to read notifications and control active media sessions.",
+                    statusLabel = if (isNotifListenerActive) "Granted" else "Not Granted",
                     isGranted = isNotifListenerActive,
+                    actionLabel = "Enable",
                     icon = Icons.Default.Notifications,
-                    onOpenSettings = {
-                        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        context.startActivity(intent)
-                    }
+                    statusTestTag = "perm_status_notif_listener",
+                    actionTestTag = "perm_action_notif_listener",
+                    onActionClick = { PermissionManager.openNotificationListenerSettings(context) }
                 )
 
-                // Contacts Permission
+                // Camera (optional)
                 PermissionAuditCard(
-                    title = "Contacts Permission",
-                    purpose = "Optional: lets Siri find contacts by name before confirmed calls or messages.",
-                    isGranted = hasContactsPermission,
-                    icon = Icons.Default.Contacts,
-                    onOpenSettings = { openAppSettings(context) }
-                )
-
-                // Exact Alarms Permission
-                PermissionAuditCard(
-                    title = "Exact Alarms & Reminders",
-                    purpose = "Ensures scheduled and recurring voice reminders fire on the exact minute.",
-                    isGranted = hasExactAlarmPermission,
-                    icon = Icons.Default.Alarm,
-                    onOpenSettings = { viewModel.deviceController.reminderScheduler.openExactAlarmPermissionSettings() }
+                    title = "Camera (Optional)",
+                    purpose = "Optional only for in-app capture; Photo Picker and Flashlight work without it.",
+                    statusLabel = if (hasCameraPermission) "Granted" else "Not Granted",
+                    isGranted = hasCameraPermission,
+                    actionLabel = "Grant",
+                    icon = Icons.Default.CameraAlt,
+                    statusTestTag = "perm_status_camera",
+                    actionTestTag = "perm_action_camera",
+                    onActionClick = { viewModel.requestPermissionIfNeeded(Manifest.permission.CAMERA) }
                 )
             }
 
@@ -696,9 +761,14 @@ fun PrivacyScreen(
 private fun PermissionAuditCard(
     title: String,
     purpose: String,
+    statusLabel: String,
     isGranted: Boolean,
+    actionLabel: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
-    onOpenSettings: () -> Unit
+    statusTestTag: String,
+    actionTestTag: String,
+    showActionWhenGranted: Boolean = false,
+    onActionClick: () -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -734,28 +804,38 @@ private fun PermissionAuditCard(
                             tint = if (isGranted) SiriGreen else Color(0xFFFFB74D),
                             modifier = Modifier.size(14.dp)
                         )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Surface(
+                            color = if (isGranted) SiriGreen.copy(alpha = 0.16f) else Color(0xFFFFB74D).copy(alpha = 0.15f),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                text = statusLabel,
+                                color = if (isGranted) SiriGreen else Color(0xFFFFB74D),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    .testTag(statusTestTag)
+                            )
+                        }
                     }
+                    Spacer(modifier = Modifier.height(2.dp))
                     Text(purpose, color = SiriTextSecondary, fontSize = 11.sp)
                 }
             }
 
-            if (!isGranted) {
+            if (!isGranted || showActionWhenGranted) {
+                Spacer(modifier = Modifier.width(8.dp))
                 Button(
-                    onClick = onOpenSettings,
+                    onClick = onActionClick,
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E2A3C)),
-                    shape = RoundedCornerShape(8.dp)
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.testTag(actionTestTag)
                 ) {
-                    Text("Enable", color = SiriCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text(actionLabel, color = SiriCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }
     }
-}
-
-private fun openAppSettings(context: Context) {
-    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-        data = Uri.fromParts("package", context.packageName, null)
-        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    }
-    context.startActivity(intent)
 }

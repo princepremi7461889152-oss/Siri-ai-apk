@@ -135,7 +135,9 @@ class SiriTextToSpeech(
                 speak(text, emo, id)
             }
         } else {
+            isInitialized = false
             pendingUtterance = null
+            onStateChange(false)
             Log.e("SiriTTS", "TextToSpeech initialization failed with status $status")
         }
     }

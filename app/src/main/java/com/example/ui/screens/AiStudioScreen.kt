@@ -71,10 +71,6 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import android.Manifest
-import android.content.pm.PackageManager
-import android.widget.Toast
-import androidx.core.content.ContextCompat
 import com.example.model.AssistantMode
 import com.example.model.LanguageOption
 import com.example.model.VoicePersonality
@@ -841,19 +837,7 @@ fun AiStudioScreen(
                         Switch(
                             checked = isForegroundServiceActive,
                             onCheckedChange = { enable ->
-                                if (enable) {
-                                    val hasMic = ContextCompat.checkSelfPermission(
-                                        context,
-                                        Manifest.permission.RECORD_AUDIO
-                                    ) == PackageManager.PERMISSION_GRANTED
-                                    if (hasMic) {
-                                        SiriVoiceService.start(context)
-                                    } else {
-                                        Toast.makeText(context, "Grant Microphone permission first for Background Voice Service.", Toast.LENGTH_SHORT).show()
-                                    }
-                                } else {
-                                    SiriVoiceService.stop(context)
-                                }
+                                viewModel.setBackgroundVoiceServiceEnabled(enable)
                             },
                             colors = SwitchDefaults.colors(checkedThumbColor = SiriCyan, checkedTrackColor = SiriCyan.copy(alpha = 0.3f)),
                             modifier = Modifier.testTag("background_voice_service_switch")

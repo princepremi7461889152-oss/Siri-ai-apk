@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.FLASHLIGHT" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Runtime permissions -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -144,6 +146,16 @@
         <receiver
             android:name=".device.ReminderReceiver"
             android:exported="false" />
+
+        <!-- Boot / update receiver to reschedule reminders and offer compliant assistant resume -->
+        <receiver
+            android:name=".device.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
     </application>
 

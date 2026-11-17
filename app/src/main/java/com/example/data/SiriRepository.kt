@@ -105,6 +105,12 @@ class SiriRepository(private val context: Context) {
     private val _wakeWordEnabled = MutableStateFlow(prefs.getBoolean("wake_word_enabled", true))
     val wakeWordEnabled: StateFlow<Boolean> = _wakeWordEnabled.asStateFlow()
 
+    private val _backgroundServiceEnabled = MutableStateFlow(prefs.getBoolean("background_service_enabled", false))
+    val backgroundServiceEnabled: StateFlow<Boolean> = _backgroundServiceEnabled.asStateFlow()
+
+    private val _backgroundWakeStandbyEnabled = MutableStateFlow(prefs.getBoolean("background_wake_standby_enabled", false))
+    val backgroundWakeStandbyEnabled: StateFlow<Boolean> = _backgroundWakeStandbyEnabled.asStateFlow()
+
     private val _customSpeedMultiplier = MutableStateFlow(prefs.getFloat("speed_multiplier", 1.0f))
     val customSpeedMultiplier: StateFlow<Float> = _customSpeedMultiplier.asStateFlow()
 
@@ -257,6 +263,33 @@ class SiriRepository(private val context: Context) {
     fun setWakeWordEnabled(enabled: Boolean) {
         _wakeWordEnabled.value = enabled
         prefs.edit().putBoolean("wake_word_enabled", enabled).apply()
+    }
+
+    fun setBackgroundServiceEnabled(enabled: Boolean) {
+        _backgroundServiceEnabled.value = enabled
+        prefs.edit().putBoolean("background_service_enabled", enabled).apply()
+    }
+
+    fun setBackgroundWakeStandbyEnabled(enabled: Boolean) {
+        _backgroundWakeStandbyEnabled.value = enabled
+        prefs.edit().putBoolean("background_wake_standby_enabled", enabled).apply()
+    }
+
+    // --- Permission Setup Tracking (tracks whether we prompted before; NEVER caches granted status) ---
+    fun hasPermissionBeenPrompted(permission: String): Boolean {
+        return prefs.getBoolean("perm_prompted_$permission", false)
+    }
+
+    fun markPermissionPrompted(permission: String) {
+        prefs.edit().putBoolean("perm_prompted_$permission", true).apply()
+    }
+
+    fun isInitialPermissionSetupDone(): Boolean {
+        return prefs.getBoolean("perm_initial_setup_done", false)
+    }
+
+    fun markInitialPermissionSetupDone() {
+        prefs.edit().putBoolean("perm_initial_setup_done", true).apply()
     }
 
     // --- User Preferences Memory ---

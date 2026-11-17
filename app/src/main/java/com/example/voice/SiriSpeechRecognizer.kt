@@ -3,6 +3,8 @@ package com.example.voice
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -20,8 +22,11 @@ class SiriSpeechRecognizer(
     private val onDetailedResult: ((matches: List<String>, confidences: FloatArray?) -> Unit)? = null,
     private val onRawRmsSample: ((normalizedRms: Float, isSpeechActive: Boolean) -> Unit)? = null,
     private val onSilentRestartNeeded: (() -> Unit)? = null,
-    private val onNoSpeechDetected: ((String) -> Unit)? = null
+    private val onNoSpeechDetected: ((String) -> Unit)? = null,
+    private val onErrorCode: ((errorCode: Int, errorMessage: String) -> Unit)? = null
 ) {
+
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var isListening: Boolean = false
@@ -34,8 +39,26 @@ class SiriSpeechRecognizer(
     private var lastRecognizedText: String = ""
     private var lastRecognizedTimestamp: Long = 0L
 
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
+    }
+
     init {
-        createRecognizer()
+        runOnMain { createRecognizer() }
+    }
+
+    fun recreateRecognizer() {
+        runOnMain {
+            try {
+                speechRecognizer?.cancel()
+            } catch (_: Exception) {
+            }
+            createRecognizer()
+        }
     }
 
     private fun createRecognizer() {
@@ -43,7 +66,11 @@ class SiriSpeechRecognizer(
             Log.w("SiriSpeech", "Speech recognition not available on this device")
             return
         }
-        speechRecognizer?.destroy()
+        try {
+            speechRecognizer?.destroy()
+        } catch (e: Exception) {
+            Log.w("SiriSpeech", "Ignoring error destroying previous recognizer", e)
+        }
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
             setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {
@@ -99,7 +126,15 @@ class SiriSpeechRecognizer(
                         SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Listening timed out"
                         else -> "Speech recognition error ($error)"
                     }
-                    Log.d("SiriSpeech", "Recognition error: $errorMsg (standby=$isStandbyMode)")
+                    Log.d("SiriSpeech", "Recognition error: $errorMsg (code=$error, standby=$isStandbyMode)")
+                    if (error == SpeechRecognizer.ERROR_CLIENT ||
+                        error == SpeechRecognizer.ERROR_AUDIO ||
+                        error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                    ) {
+                        // Reset wedged SpeechRecognizer instance so subsequent recognition recovers cleanly
+                        createRecognizer()
+                    }
+                    onErrorCode?.invoke(error, errorMsg)
                     if (isStandbyMode) {
                         if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                             isStandbyMode = false
@@ -168,93 +203,108 @@ class SiriSpeechRecognizer(
     }
 
     fun startListening(standbyMode: Boolean = false) {
-        isStandbyMode = standbyMode
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            if (!standbyMode) {
-                onErrorOccurred("Speech recognizer is not available on this device.")
-            }
-            return
-        }
-
-        if (speechRecognizer == null) {
-            createRecognizer()
-        }
-
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, !standbyMode)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-            if (preferOffline) {
-                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+        runOnMain {
+            isStandbyMode = standbyMode
+            if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+                if (!standbyMode) {
+                    onErrorOccurred("Speech recognizer is not available on this device.")
+                }
+                return@runOnMain
             }
 
-            // Fast endpointing to reduce post-speech lag
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, if (standbyMode) 550L else 750L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, if (standbyMode) 400L else 550L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 350L)
-            putExtra("android.speech.extra.DICTATION_MODE", false)
+            if (speechRecognizer == null) {
+                createRecognizer()
+            }
 
-            val langLocale = when (currentLanguage) {
-                LanguageOption.HINDI -> "hi-IN"
-                LanguageOption.HINGLISH -> "en-IN"
-                LanguageOption.ENGLISH -> "en-US"
-                LanguageOption.AUTO -> "en-US"
-            }
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, langLocale)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, langLocale)
-            if (currentLanguage == LanguageOption.AUTO || currentLanguage == LanguageOption.HINGLISH) {
-                putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("hi-IN", "en-US"))
-            }
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
-        }
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, !standbyMode)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                if (preferOffline) {
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                }
 
-        try {
-            speechRecognizer?.startListening(intent)
-            isListening = true
-            isSpeechActive = false
-            if (!standbyMode) {
-                onListeningStateChanged(true)
+                // Fast endpointing to reduce post-speech lag
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, if (standbyMode) 550L else 750L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, if (standbyMode) 400L else 550L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 350L)
+                putExtra("android.speech.extra.DICTATION_MODE", false)
+
+                val langLocale = when (currentLanguage) {
+                    LanguageOption.HINDI -> "hi-IN"
+                    LanguageOption.HINGLISH -> "en-IN"
+                    LanguageOption.ENGLISH -> "en-US"
+                    LanguageOption.AUTO -> "en-US"
+                }
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, langLocale)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, langLocale)
+                if (currentLanguage == LanguageOption.AUTO || currentLanguage == LanguageOption.HINGLISH) {
+                    putExtra("android.speech.extra.EXTRA_ADDITIONAL_LANGUAGES", arrayOf("hi-IN", "en-US"))
+                }
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
             }
-        } catch (e: Exception) {
-            Log.e("SiriSpeech", "Failed to start listening", e)
-            if (!standbyMode) {
-                onErrorOccurred("Could not start microphone: ${e.message}")
+
+            try {
+                speechRecognizer?.startListening(intent)
+                isListening = true
+                isSpeechActive = false
+                if (!standbyMode) {
+                    onListeningStateChanged(true)
+                }
+            } catch (e: Exception) {
+                Log.e("SiriSpeech", "Failed to start listening", e)
+                createRecognizer()
+                if (!standbyMode) {
+                    onErrorOccurred("Could not start microphone: ${e.message}")
+                }
             }
         }
     }
 
     fun stopListening() {
-        isStandbyMode = false
-        try {
-            speechRecognizer?.stopListening()
-        } catch (e: Exception) {
-            Log.e("SiriSpeech", "Error stopping listening", e)
+        runOnMain {
+            isStandbyMode = false
+            try {
+                speechRecognizer?.stopListening()
+            } catch (e: Exception) {
+                Log.e("SiriSpeech", "Error stopping listening", e)
+            }
+            isListening = false
+            isSpeechActive = false
+            onListeningStateChanged(false)
         }
-        isListening = false
-        isSpeechActive = false
-        onListeningStateChanged(false)
     }
 
     fun cancel() {
-        isStandbyMode = false
-        try {
-            speechRecognizer?.cancel()
-        } catch (e: Exception) {
-            Log.e("SiriSpeech", "Error cancelling listening", e)
+        runOnMain {
+            isStandbyMode = false
+            try {
+                speechRecognizer?.cancel()
+            } catch (e: Exception) {
+                Log.e("SiriSpeech", "Error cancelling listening", e)
+            }
+            isListening = false
+            isSpeechActive = false
+            onListeningStateChanged(false)
         }
-        isListening = false
-        isSpeechActive = false
-        onListeningStateChanged(false)
     }
 
     fun destroy() {
-        cancel()
-        try {
-            speechRecognizer?.destroy()
-        } catch (e: Exception) {
-            Log.e("SiriSpeech", "Error destroying speech recognizer", e)
+        runOnMain {
+            isStandbyMode = false
+            try {
+                speechRecognizer?.cancel()
+            } catch (_: Exception) {
+            }
+            isListening = false
+            isSpeechActive = false
+            try {
+                speechRecognizer?.destroy()
+            } catch (e: Exception) {
+                Log.e("SiriSpeech", "Error destroying speech recognizer", e)
+            }
+            speechRecognizer = null
         }
-        speechRecognizer = null
     }
 
     fun isCurrentlyListening(): Boolean = isListening

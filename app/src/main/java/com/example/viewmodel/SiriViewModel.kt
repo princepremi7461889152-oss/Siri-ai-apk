@@ -15,6 +15,8 @@ import com.example.ai.OfflineAssistantEngine
 import com.example.data.SiriRepository
 import com.example.device.AndroidDeviceController
 import com.example.device.AppLaunchOutcome
+import com.example.device.PermissionManager
+import com.example.device.PermissionStatusSnapshot
 import com.example.intent.SiriIntentParser
 import com.example.model.AppChoiceOption
 import com.example.model.AssistantEmotion
@@ -33,6 +35,7 @@ import com.example.model.VoiceGender
 import com.example.model.VoicePersonality
 import com.example.model.VoiceState
 import com.example.service.SiriNotificationListenerService
+import com.example.service.SiriVoiceService
 import com.example.voice.SiriSpeechRecognizer
 import com.example.voice.SiriTextToSpeech
 import com.example.voice.WakeWordDetector
@@ -146,8 +149,13 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
 
     val onDeviceAiSupported: Boolean = deviceController.isOnDeviceAiHardwareSupported()
 
-    private val _permissionRequestEvents = MutableSharedFlow<String>(extraBufferCapacity = 2)
+    private val _permissionRequestEvents = MutableSharedFlow<String>(extraBufferCapacity = 4)
     val permissionRequestEvents: SharedFlow<String> = _permissionRequestEvents.asSharedFlow()
+
+    private val _permissionStatus = MutableStateFlow(PermissionManager.getSnapshot(application))
+    val permissionStatus: StateFlow<PermissionStatusSnapshot> = _permissionStatus.asStateFlow()
+
+    val isBackgroundServiceActive: StateFlow<Boolean> = SiriVoiceService.isServiceRunningFlow
 
     private var unregisterConnectivityCallback: (() -> Unit)? = null
 
@@ -160,10 +168,129 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         initSpeechRecognizer()
         initIntentParser()
         syncVoiceOfflinePreference()
+        refreshPermissionStatus()
+        viewModelScope.launch {
+            SiriVoiceService.isServiceRunningFlow.collect {
+                refreshPermissionStatus()
+            }
+        }
         unregisterConnectivityCallback = deviceController.observeConnectivity { online: Boolean ->
             _isOnline.value = online
             syncVoiceOfflinePreference()
         }
+    }
+
+    fun refreshPermissionStatus() {
+        _permissionStatus.value = PermissionManager.getSnapshot(getApplication())
+    }
+
+    fun requestPermissionIfNeeded(permission: String) {
+        if (PermissionManager.isGranted(getApplication(), permission)) {
+            refreshPermissionStatus()
+            return
+        }
+        _permissionRequestEvents.tryEmit(permission)
+    }
+
+    /**
+     * Prompts for Microphone permission at most once on first launch when not already granted.
+     * Subsequent app launches NEVER re-prompt automatically.
+     */
+    fun runFirstLaunchPermissionCheck() {
+        refreshPermissionStatus()
+        if (repository.isInitialPermissionSetupDone()) return
+        repository.markInitialPermissionSetupDone()
+        if (!PermissionManager.isGranted(getApplication(), Manifest.permission.RECORD_AUDIO) &&
+            !repository.hasPermissionBeenPrompted(Manifest.permission.RECORD_AUDIO)
+        ) {
+            _permissionRequestEvents.tryEmit(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    fun onPermissionResult(permission: String, granted: Boolean) {
+        repository.markPermissionPrompted(permission)
+        refreshPermissionStatus()
+        if (granted && permission == Manifest.permission.RECORD_AUDIO &&
+            repository.backgroundServiceEnabled.value &&
+            !SiriVoiceService.isServiceRunning
+        ) {
+            SiriVoiceService.start(
+                getApplication(),
+                enableWakeStandby = repository.backgroundWakeStandbyEnabled.value
+            )
+            refreshPermissionStatus()
+        }
+    }
+
+    fun onAppForegrounded() {
+        refreshPermissionStatus()
+        if (SiriVoiceService.isServiceRunning) {
+            SiriVoiceService.pauseForForegroundUi(getApplication())
+        } else if (repository.backgroundServiceEnabled.value && hasRecordAudioPermission()) {
+            SiriVoiceService.start(
+                getApplication(),
+                enableWakeStandby = repository.backgroundWakeStandbyEnabled.value
+            )
+            SiriVoiceService.pauseForForegroundUi(getApplication())
+        }
+    }
+
+    fun onAppBackgrounded() {
+        val hadUiWakeStandby = _isWakeWordStandby.value
+        if (hadUiWakeStandby) {
+            _isWakeWordStandby.value = false
+            standbyRestartJob?.cancel()
+            repository.setBackgroundWakeStandbyEnabled(true)
+        }
+        if (_voiceState.value == VoiceState.LISTENING) {
+            sessionTimeoutJob?.cancel()
+            _voiceState.value = VoiceState.IDLE
+            _audioLevel.value = 0.08f
+        }
+        speechRecognizer?.cancel()
+
+        val shouldRunService = SiriVoiceService.isServiceRunning || repository.backgroundServiceEnabled.value
+        if (shouldRunService && hasRecordAudioPermission()) {
+            if (!SiriVoiceService.isServiceRunning) {
+                SiriVoiceService.start(
+                    getApplication(),
+                    enableWakeStandby = repository.backgroundWakeStandbyEnabled.value || hadUiWakeStandby
+                )
+            } else {
+                SiriVoiceService.resumeAfterForegroundUi(getApplication())
+            }
+        }
+        refreshPermissionStatus()
+    }
+
+    fun setBackgroundVoiceServiceEnabled(enable: Boolean) {
+        if (enable) {
+            if (!hasRecordAudioPermission()) {
+                requestPermissionIfNeeded(Manifest.permission.RECORD_AUDIO)
+                viewModelScope.launch {
+                    _uiEvents.emit("Microphone permission is needed for Background Voice Service.")
+                }
+                return
+            }
+            repository.setBackgroundServiceEnabled(true)
+            val started = SiriVoiceService.start(
+                getApplication(),
+                enableWakeStandby = repository.backgroundWakeStandbyEnabled.value
+            )
+            if (!started) {
+                viewModelScope.launch {
+                    _uiEvents.emit("Unable to start background service right now. Check Android battery & permissions.")
+                }
+            } else if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+                !PermissionManager.isGranted(getApplication(), Manifest.permission.POST_NOTIFICATIONS) &&
+                !repository.hasPermissionBeenPrompted(Manifest.permission.POST_NOTIFICATIONS)
+            ) {
+                requestPermissionIfNeeded(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        } else {
+            SiriVoiceService.stop(getApplication())
+        }
+        refreshPermissionStatus()
     }
 
     private fun computeResolvedMode(mode: AssistantMode, online: Boolean): AssistantMode {
@@ -372,9 +499,12 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
     fun startWakeWordStandby() {
         if (!hasRecordAudioPermission()) {
             _isWakeWordStandby.value = false
-            _permissionRequestEvents.tryEmit(Manifest.permission.RECORD_AUDIO)
+            requestPermissionIfNeeded(Manifest.permission.RECORD_AUDIO)
             viewModelScope.launch { _uiEvents.emit("Microphone permission is needed for Hey Siri standby.") }
             return
+        }
+        if (SiriVoiceService.isServiceRunning) {
+            SiriVoiceService.pauseForForegroundUi(getApplication())
         }
         stopAllSpeech()
         _isWakeWordStandby.value = true
@@ -384,6 +514,7 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopWakeWordStandby() {
         _isWakeWordStandby.value = false
+        repository.setBackgroundWakeStandbyEnabled(false)
         standbyRestartJob?.cancel()
         speechRecognizer?.cancel()
         if (_voiceState.value == VoiceState.LISTENING) {
@@ -606,9 +737,12 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
     fun startListening() {
         if (!hasRecordAudioPermission()) {
             _voiceState.value = VoiceState.IDLE
-            _permissionRequestEvents.tryEmit(Manifest.permission.RECORD_AUDIO)
+            requestPermissionIfNeeded(Manifest.permission.RECORD_AUDIO)
             viewModelScope.launch { _uiEvents.emit("Microphone permission is required to listen.") }
             return
+        }
+        if (SiriVoiceService.isServiceRunning) {
+            SiriVoiceService.pauseForForegroundUi(getApplication())
         }
         stopWakeWordStandby()
         stopAllSpeech()
@@ -933,6 +1067,10 @@ class SiriViewModel(application: Application) : AndroidViewModel(application) {
         repository.addMessage(assistantMsg)
         repository.logActionExecution(result.intentName, result.actionSummary ?: result.feedbackSpeech, result.success, result.isReversible, result.undoAction)
         speakResponse(result.feedbackSpeech, effectiveEmotion)
+
+        if (result.intentName == "CONTACT_PERMISSION_REQUIRED") {
+            requestPermissionIfNeeded(Manifest.permission.READ_CONTACTS)
+        }
 
         // When online web search succeeds, fetch a concise spoken summary and read it aloud
         val searchQuery = result.parameters["query"]
